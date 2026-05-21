@@ -113,7 +113,7 @@ fn expectNetworkBlocked() !void {
         linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
         linux.IPPROTO.TCP,
     );
-    switch (std.posix.errno(socket_rc)) {
+    switch (linuxErrno(socket_rc)) {
         .SUCCESS => {},
         .AFNOSUPPORT, .PROTONOSUPPORT => return,
         else => |err| {
@@ -133,7 +133,7 @@ fn expectNetworkBlocked() !void {
         @as(*const linux.sockaddr, @ptrCast(&addr)),
         @sizeOf(linux.sockaddr.in),
     );
-    switch (std.posix.errno(connect_rc)) {
+    switch (linuxErrno(connect_rc)) {
         .NETUNREACH, .HOSTUNREACH, .NETDOWN, .ADDRNOTAVAIL, .ACCES, .PERM => return,
         .SUCCESS, .INPROGRESS, .ALREADY, .ISCONN => {
             std.debug.print("network block check found a reachable TCP path\n", .{});
@@ -191,7 +191,7 @@ fn expectLoopbackTcp() !void {
         .port = 0,
         .addr = 0,
     };
-    switch (std.posix.errno(linux.bind(
+    switch (linuxErrno(linux.bind(
         listener_fd,
         @as(*const linux.sockaddr, @ptrCast(&bind_addr)),
         @sizeOf(linux.sockaddr.in),
@@ -202,7 +202,7 @@ fn expectLoopbackTcp() !void {
             return error.LoopbackCheckFailed;
         },
     }
-    switch (std.posix.errno(linux.listen(listener_fd, 1))) {
+    switch (linuxErrno(linux.listen(listener_fd, 1))) {
         .SUCCESS => {},
         else => |err| {
             std.debug.print("loopback check could not listen: {s}\n", .{@tagName(err)});
@@ -212,7 +212,7 @@ fn expectLoopbackTcp() !void {
 
     var bound_addr: linux.sockaddr.in = std.mem.zeroes(linux.sockaddr.in);
     var bound_addr_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-    switch (std.posix.errno(linux.getsockname(
+    switch (linuxErrno(linux.getsockname(
         listener_fd,
         @as(*linux.sockaddr, @ptrCast(&bound_addr)),
         &bound_addr_len,
@@ -231,7 +231,7 @@ fn expectLoopbackTcp() !void {
         .port = bound_addr.port,
         .addr = std.mem.nativeToBig(u32, 0x7f000001),
     };
-    switch (std.posix.errno(linux.connect(
+    switch (linuxErrno(linux.connect(
         client_fd,
         @as(*const linux.sockaddr, @ptrCast(&connect_addr)),
         @sizeOf(linux.sockaddr.in),
@@ -244,7 +244,7 @@ fn expectLoopbackTcp() !void {
     }
 
     const accepted_rc = linux.accept(listener_fd, null, null);
-    switch (std.posix.errno(accepted_rc)) {
+    switch (linuxErrno(accepted_rc)) {
         .SUCCESS => _ = linux.close(@intCast(accepted_rc)),
         else => |err| {
             std.debug.print("loopback check could not accept local connection: {s}\n", .{@tagName(err)});
@@ -256,13 +256,17 @@ fn expectLoopbackTcp() !void {
 fn tcpSocket() !i32 {
     const linux = std.os.linux;
     const socket_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-    switch (std.posix.errno(socket_rc)) {
+    switch (linuxErrno(socket_rc)) {
         .SUCCESS => return @intCast(socket_rc),
         else => |err| {
             std.debug.print("network check could not create TCP socket: {s}\n", .{@tagName(err)});
             return error.NetworkCheckFailed;
         },
     }
+}
+
+fn linuxErrno(rc: usize) std.os.linux.E {
+    return std.os.linux.errno(rc);
 }
 
 fn hashPath(
@@ -407,4 +411,9 @@ test "parseArgs accepts network block check" {
     try std.testing.expect(options.expect_localhost_hosts);
     try std.testing.expectEqual(@as(usize, 1), options.extra_out_files.items.len);
     try std.testing.expectEqualStrings("out/a.txt", options.extra_out_files.items[0]);
+}
+
+test "linuxErrno decodes raw Linux syscall errors" {
+    const rc: usize = @bitCast(@as(isize, -@as(isize, @intFromEnum(std.os.linux.E.NETUNREACH))));
+    try std.testing.expectEqual(std.os.linux.E.NETUNREACH, linuxErrno(rc));
 }

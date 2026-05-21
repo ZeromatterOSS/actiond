@@ -27,6 +27,7 @@ Environment:
   ACTIOND_E2E_NESTED_GROUPS=8
   ACTIOND_E2E_NESTED_FILES_PER_GROUP=96
   ACTIOND_E2E_STANDALONE=1
+  ACTIOND_E2E_ROOTLESS=1
   ACTIOND_E2E_JOBS=8
   ACTIOND_E2E_REMOTE_GRPC_LOG=/path/to/remote_grpc.log
 EOF
@@ -103,6 +104,7 @@ prepare_stress_workspace() {
 
   run_bazel build "${label}"
   mkdir -p "${test_workspace}/tool"
+  rm -f "${test_workspace}/tool/action-tool"
   cp "$(bazel_output "${label}")" "${test_workspace}/tool/action-tool"
   chmod +x "${test_workspace}/tool/action-tool"
   "${test_workspace}/tools/generate_inputs.sh"
@@ -125,6 +127,18 @@ wait_for_port() {
     fi
     sleep 0.2
   done
+}
+
+check_e2e_server_running() {
+  if [[ -z "${e2e_server_pid}" ]]; then
+    echo "e2e server was not started" >&2
+    return 1
+  fi
+  if ! kill -0 "${e2e_server_pid}" >/dev/null 2>&1; then
+    wait "${e2e_server_pid}" >/dev/null 2>&1 || true
+    echo "e2e server exited before the workload started" >&2
+    return 1
+  fi
 }
 
 run_stress_workspace() {
@@ -181,7 +195,21 @@ run_linux_e2e() {
     --listen="${endpoint}"
     --root="${root}/server"
   )
-  if [[ "${ACTIOND_E2E_STANDALONE:-0}" == "1" ]]; then
+  if [[ "${ACTIOND_E2E_ROOTLESS:-0}" == "1" ]]; then
+    if [[ "${ACTIOND_E2E_STANDALONE:-0}" == "1" ]]; then
+      echo "ACTIOND_E2E_ROOTLESS=1 requires an extracted runtime root and does not support ACTIOND_E2E_STANDALONE=1" >&2
+      return 1
+    fi
+    run_bazel build //cmd/linux_actiond:linux-actiond
+    run_bazel build //runtimes:runtimes_squashfs
+    server="$(bazel_output //cmd/linux_actiond:linux-actiond)"
+    local runtimes runtime_root
+    runtimes="$(bazel_output //runtimes:runtimes_squashfs)"
+    runtime_root="${root}/runtimes"
+    mkdir -p "${runtime_root}"
+    unsquashfs -quiet -f -d "${runtime_root}" "${runtimes}"
+    server_args+=(--rootless --runtime-root="${runtime_root}")
+  elif [[ "${ACTIOND_E2E_STANDALONE:-0}" == "1" ]]; then
     run_bazel build //cmd/linux_actiond:linux-actiond-standalone
     server="$(bazel_output //cmd/linux_actiond:linux-actiond-standalone)"
   else
@@ -202,6 +230,7 @@ run_linux_e2e() {
   trap 'cleanup_e2e_server $?' EXIT
 
   wait_for_port "${e2e_host}" "${e2e_port}" 30
+  check_e2e_server_running
   run_stress_workspace
   cleanup_e2e_server 0
   trap - EXIT
@@ -261,6 +290,7 @@ run_vm_e2e() {
   trap 'cleanup_e2e_server $?' EXIT
 
   wait_for_port "${e2e_host}" "${e2e_port}" 90
+  check_e2e_server_running
   run_stress_workspace
   cleanup_e2e_server 0
   trap - EXIT

@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const action_cache = @import("action_cache.zig");
 const action_executor = @import("action_executor.zig");
+const action_runner = @import("action_runner.zig");
 const cas = @import("cas.zig");
 const embedded_payload = @import("embedded_payload.zig");
 const grpc_http2_server = @import("grpc_http2_server.zig");
@@ -11,6 +12,9 @@ const runtime_mount = @import("runtime_mount.zig");
 pub const Error = error{
     UnknownServeArgument,
     MissingServeArgumentValue,
+    InvalidRootlessRuntimeOptions,
+    UnknownRootlessUidMode,
+    UnsupportedRootlessUidMode,
     UnsupportedHost,
 };
 
@@ -19,6 +23,8 @@ pub const ServeOptions = struct {
     root: []const u8 = "/tmp/actiond",
     runtime_image: ?[]const u8 = null,
     runtime_root: ?[]const u8 = null,
+    rootless: bool = false,
+    rootless_uid_mode: action_runner.RootlessUidMode = .single,
 };
 
 pub fn parseServeArgs(args: []const []const u8) !ServeOptions {
@@ -50,6 +56,14 @@ pub fn parseServeArgs(args: []const []const u8) !ServeOptions {
             options.runtime_root = args[i];
         } else if (std.mem.startsWith(u8, arg, "--runtime-root=")) {
             options.runtime_root = arg["--runtime-root=".len..];
+        } else if (std.mem.eql(u8, arg, "--rootless")) {
+            options.rootless = true;
+        } else if (std.mem.eql(u8, arg, "--rootless-uid-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingServeArgumentValue;
+            options.rootless_uid_mode = try parseRootlessUidMode(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--rootless-uid-mode=")) {
+            options.rootless_uid_mode = try parseRootlessUidMode(arg["--rootless-uid-mode=".len..]);
         } else {
             return error.UnknownServeArgument;
         }
@@ -58,12 +72,19 @@ pub fn parseServeArgs(args: []const []const u8) !ServeOptions {
     return options;
 }
 
+fn parseRootlessUidMode(value: []const u8) !action_runner.RootlessUidMode {
+    if (std.mem.eql(u8, value, "single")) return .single;
+    if (std.mem.eql(u8, value, "subid")) return .subid;
+    return error.UnknownRootlessUidMode;
+}
+
 pub fn serve(
     io: std.Io,
     allocator: std.mem.Allocator,
     options: ServeOptions,
 ) !void {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+    try validateServeOptions(options);
 
     var root_dir = try std.Io.Dir.cwd().createDirPathOpen(io, options.root, .{});
     defer root_dir.close(io);
@@ -98,6 +119,10 @@ pub fn serve(
 
     var execution_options = try action_executor.prepareExecuteOptions(io, allocator, cas.Store.initReady(cas_dir), .{
         .runtime_root_path = mounted_runtime.path(),
+        .isolation_mode = if (options.rootless)
+            .{ .rootless = .{ .uid_mode = options.rootless_uid_mode } }
+        else
+            .privileged,
     });
     defer execution_options.deinit(allocator);
 
@@ -111,6 +136,13 @@ pub fn serve(
     return grpc_http2_server.serve(io, allocator, .{
         .listen = options.listen,
     }, server);
+}
+
+fn validateServeOptions(options: ServeOptions) !void {
+    if (options.rootless and (options.runtime_root == null or options.runtime_image != null)) {
+        return error.InvalidRootlessRuntimeOptions;
+    }
+    if (options.rootless and options.rootless_uid_mode != .single) return error.UnsupportedRootlessUidMode;
 }
 
 test "parseServeArgs accepts split and equals flags" {
@@ -139,9 +171,51 @@ test "parseServeArgs accepts runtime image and runtime root flags" {
     try std.testing.expectEqual(@as(?[]const u8, null), root_options.runtime_image);
 }
 
+test "parseServeArgs accepts rootless flags" {
+    const options = try parseServeArgs(&.{
+        "--rootless",
+        "--rootless-uid-mode=single",
+        "--runtime-root",
+        "/tmp/actiond-runtimes",
+    });
+
+    try std.testing.expect(options.rootless);
+    try std.testing.expectEqual(action_runner.RootlessUidMode.single, options.rootless_uid_mode);
+    try std.testing.expectEqualStrings("/tmp/actiond-runtimes", options.runtime_root.?);
+
+    const subid_options = try parseServeArgs(&.{
+        "--rootless-uid-mode",
+        "subid",
+    });
+    try std.testing.expectEqual(action_runner.RootlessUidMode.subid, subid_options.rootless_uid_mode);
+}
+
+test "validateServeOptions rejects unsupported rootless runtime combinations" {
+    try std.testing.expectError(error.InvalidRootlessRuntimeOptions, validateServeOptions(.{
+        .rootless = true,
+    }));
+    try std.testing.expectError(error.InvalidRootlessRuntimeOptions, validateServeOptions(.{
+        .rootless = true,
+        .runtime_image = "/tmp/runtimes.sqfs",
+        .runtime_root = "/tmp/runtimes",
+    }));
+    try std.testing.expectError(error.UnsupportedRootlessUidMode, validateServeOptions(.{
+        .rootless = true,
+        .runtime_root = "/tmp/runtimes",
+        .rootless_uid_mode = .subid,
+    }));
+    try validateServeOptions(.{
+        .rootless = true,
+        .runtime_root = "/tmp/runtimes",
+        .rootless_uid_mode = .single,
+    });
+}
+
 test "parseServeArgs rejects unknown flags" {
     try std.testing.expectError(error.UnknownServeArgument, parseServeArgs(&.{"--bad"}));
     try std.testing.expectError(error.MissingServeArgumentValue, parseServeArgs(&.{"--root"}));
     try std.testing.expectError(error.MissingServeArgumentValue, parseServeArgs(&.{"--runtime-image"}));
     try std.testing.expectError(error.MissingServeArgumentValue, parseServeArgs(&.{"--runtime-root"}));
+    try std.testing.expectError(error.MissingServeArgumentValue, parseServeArgs(&.{"--rootless-uid-mode"}));
+    try std.testing.expectError(error.UnknownRootlessUidMode, parseServeArgs(&.{"--rootless-uid-mode=bad"}));
 }

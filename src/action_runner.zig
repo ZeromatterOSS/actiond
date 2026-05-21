@@ -5,6 +5,9 @@ const reapi = @import("reapi.zig");
 
 pub const Error = error{
     MissingArgv,
+    RootlessIdMapFailed,
+    RootlessSetupFailed,
+    UnsupportedRootlessUidMode,
     UnsupportedHost,
 };
 
@@ -51,6 +54,21 @@ pub const RunOptions = struct {
     cgroup_limits: CgroupLimits = .{},
     sandbox_uid: u32 = 65534,
     sandbox_gid: u32 = 65534,
+    isolation_mode: LinuxIsolationMode = .privileged,
+};
+
+pub const RootlessUidMode = enum {
+    single,
+    subid,
+};
+
+pub const RootlessOptions = struct {
+    uid_mode: RootlessUidMode = .single,
+};
+
+pub const LinuxIsolationMode = union(enum) {
+    privileged,
+    rootless: RootlessOptions,
 };
 
 pub const BindMount = struct {
@@ -308,11 +326,11 @@ fn prepareChrootWritableSubdirs(
 
 fn makeDirectoryWritableBySandbox(fd: std.posix.fd_t, uid: u32, gid: u32) !void {
     const linux = std.os.linux;
-    switch (std.posix.errno(linux.fchown(fd, @intCast(uid), @intCast(gid)))) {
+    switch (linuxErrno(linux.fchown(fd, @intCast(uid), @intCast(gid)))) {
         .SUCCESS => {},
         else => return error.Unexpected,
     }
-    switch (std.posix.errno(linux.fchmod(fd, 0o755))) {
+    switch (linuxErrno(linux.fchmod(fd, 0o755))) {
         .SUCCESS => {},
         else => return error.Unexpected,
     }
@@ -401,6 +419,7 @@ fn runCommandChroot(
         .cgroup_procs_path = if (cgroup.procs_path) |path| path.ptr else null,
         .sandbox_uid = options.sandbox_uid,
         .sandbox_gid = options.sandbox_gid,
+        .isolation_mode = options.isolation_mode,
     });
     const fork_completed = std.Io.Clock.awake.now(io);
     var child_waited = false;
@@ -469,20 +488,183 @@ const ForkAction = struct {
     cgroup_procs_path: ?[*:0]const u8,
     sandbox_uid: u32,
     sandbox_gid: u32,
+    isolation_mode: LinuxIsolationMode,
 };
 
 const child_setup_fd: std.posix.fd_t = 3;
 
 fn forkAction(action: ForkAction) !std.os.linux.pid_t {
+    return switch (action.isolation_mode) {
+        .privileged => forkPrivilegedAction(action),
+        .rootless => |options| forkRootlessAction(action, options),
+    };
+}
+
+fn forkPrivilegedAction(action: ForkAction) !std.os.linux.pid_t {
     const linux = std.os.linux;
     const rc = linux.fork();
-    switch (std.posix.errno(rc)) {
+    switch (linuxErrno(rc)) {
         .SUCCESS => {},
         .AGAIN, .NOMEM => return error.SystemResources,
         else => return error.Unexpected,
     }
     const pid: std.os.linux.pid_t = @intCast(rc);
     if (pid != 0) return pid;
+
+    forkActionChild(action, null);
+}
+
+fn forkRootlessAction(action: ForkAction, options: RootlessOptions) !std.os.linux.pid_t {
+    if (options.uid_mode != .single) return error.UnsupportedRootlessUidMode;
+
+    const linux = std.os.linux;
+    const map_ready_pipe = try linuxPipe();
+    errdefer closePipe(map_ready_pipe);
+    const map_continue_pipe = try linuxPipe();
+    errdefer closePipe(map_continue_pipe);
+
+    const rc = linux.fork();
+    switch (linuxErrno(rc)) {
+        .SUCCESS => {},
+        .AGAIN, .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+    const pid: std.os.linux.pid_t = @intCast(rc);
+    if (pid != 0) {
+        closeFd(map_ready_pipe[1]);
+        closeFd(map_continue_pipe[0]);
+        errdefer {
+            closeFd(map_ready_pipe[0]);
+            closeFd(map_continue_pipe[1]);
+        }
+
+        if (!parentReadHandshake(map_ready_pipe[0])) {
+            closeFd(map_ready_pipe[0]);
+            closeFd(map_continue_pipe[1]);
+            reapFailedSetupChild(pid);
+            return error.RootlessSetupFailed;
+        }
+        closeFd(map_ready_pipe[0]);
+
+        const map_result = writeSingleIdMaps(pid);
+        parentWriteHandshake(map_continue_pipe[1], map_result) catch {};
+        closeFd(map_continue_pipe[1]);
+        if (!map_result) {
+            reapFailedSetupChild(pid);
+            return error.RootlessIdMapFailed;
+        }
+        return pid;
+    }
+
+    childClose(map_ready_pipe[0]);
+    childClose(map_continue_pipe[1]);
+    forkActionChild(action, .{
+        .map_ready_fd = map_ready_pipe[1],
+        .map_continue_fd = map_continue_pipe[0],
+    });
+}
+
+const RootlessChildHandshake = struct {
+    map_ready_fd: std.posix.fd_t,
+    map_continue_fd: std.posix.fd_t,
+};
+
+fn parentReadHandshake(fd: std.posix.fd_t) bool {
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const rc = std.os.linux.read(fd, byte[0..].ptr, byte.len);
+        switch (linuxErrno(rc)) {
+            .SUCCESS => return rc == 1 and byte[0] == '1',
+            .INTR => continue,
+            else => return false,
+        }
+    }
+}
+
+fn parentWriteHandshake(fd: std.posix.fd_t, success: bool) !void {
+    const byte: [1]u8 = .{if (success) '1' else '0'};
+    try writeAllFd(fd, &byte);
+}
+
+fn childSignalRootlessParent(fd: std.posix.fd_t) void {
+    const byte: [1]u8 = .{'1'};
+    writeAllFd(fd, &byte) catch std.os.linux.exit(127);
+}
+
+fn childWaitForRootlessMap(fd: std.posix.fd_t) void {
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const rc = std.os.linux.read(fd, byte[0..].ptr, byte.len);
+        switch (linuxErrno(rc)) {
+            .SUCCESS => {
+                if (rc == 1 and byte[0] == '1') return;
+                std.os.linux.exit(127);
+            },
+            .INTR => continue,
+            else => std.os.linux.exit(127),
+        }
+    }
+}
+
+fn writeSingleIdMaps(pid: std.os.linux.pid_t) bool {
+    const uid = std.os.linux.getuid();
+    const gid = std.os.linux.getgid();
+
+    if (!writeProcMapFile(pid, "setgroups", "deny\n")) return false;
+
+    var uid_map: [64]u8 = undefined;
+    const uid_bytes = std.fmt.bufPrint(&uid_map, "0 {d} 1\n", .{uid}) catch return false;
+    if (!writeProcMapFile(pid, "uid_map", uid_bytes)) return false;
+
+    var gid_map: [64]u8 = undefined;
+    const gid_bytes = std.fmt.bufPrint(&gid_map, "0 {d} 1\n", .{gid}) catch return false;
+    if (!writeProcMapFile(pid, "gid_map", gid_bytes)) return false;
+
+    return true;
+}
+
+fn writeProcMapFile(pid: std.os.linux.pid_t, comptime name: []const u8, bytes: []const u8) bool {
+    var path_buffer: [128]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/{s}", .{ pid, name }) catch return false;
+    const fd_rc = std.os.linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    switch (linuxErrno(fd_rc)) {
+        .SUCCESS => {},
+        else => return false,
+    }
+    const fd: std.posix.fd_t = @intCast(fd_rc);
+    defer closeFd(fd);
+    writeAllFd(fd, bytes) catch return false;
+    return true;
+}
+
+fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const rc = std.os.linux.write(fd, bytes[offset..].ptr, bytes.len - offset);
+        switch (linuxErrno(rc)) {
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                if (n == 0) return error.Unexpected;
+                offset += n;
+            },
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn reapFailedSetupChild(pid: std.os.linux.pid_t) void {
+    _ = std.os.linux.kill(pid, .KILL);
+    var raw_status: u32 = 0;
+    while (true) switch (linuxErrno(std.os.linux.waitpid(pid, &raw_status, 0))) {
+        .SUCCESS, .CHILD => return,
+        .INTR => continue,
+        else => return,
+    };
+}
+
+fn forkActionChild(action: ForkAction, rootless: ?RootlessChildHandshake) noreturn {
+    const linux = std.os.linux;
 
     childDup2(action.stdin_pipe[0], std.posix.STDIN_FILENO);
     childDup2(action.stdout_pipe[1], std.posix.STDOUT_FILENO);
@@ -501,6 +683,13 @@ fn forkAction(action: ForkAction) !std.os.linux.pid_t {
 
     childSyscallName(linux.setpgid(0, 0), "setpgid");
     if (action.cgroup_procs_path) |path| childWriteFile(path, "0\n");
+    if (rootless) |handshake| {
+        childSyscallName(linux.unshare(linux.CLONE.NEWUSER), "unshare_user_namespace");
+        childSignalRootlessParent(handshake.map_ready_fd);
+        childWaitForRootlessMap(handshake.map_continue_fd);
+        childClose(handshake.map_ready_fd);
+        childClose(handshake.map_continue_fd);
+    }
     childSyscallName(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0), "prctl_no_new_privs");
     childCloseExtraFdsFrom(child_setup_fd + 1);
     childSyscallName(linux.unshare(actionNamespaceFlags()), "unshare_namespaces");
@@ -510,11 +699,15 @@ fn forkAction(action: ForkAction) !std.os.linux.pid_t {
     for (action.bind_mounts) |mount| childBindMountReadOnly(mount);
     childSyscallName(linux.chroot(action.chroot_dir.ptr), "chroot");
     childSyscallName(linux.chdir(action.cwd.ptr), "chdir");
-    childDropPrivileges(action.sandbox_uid, action.sandbox_gid);
+    if (rootless == null) {
+        childDropPrivileges(action.sandbox_uid, action.sandbox_gid);
+    } else {
+        childDropCapabilities();
+    }
     childWriteSetupComplete();
     const execve_rc = linux.execve(action.exec_path.ptr, action.argv, action.envp);
     childWriteLiteral("actiond child setup failed: execve ");
-    childWriteBytes(@tagName(std.posix.errno(execve_rc)));
+    childWriteBytes(@tagName(linuxErrno(execve_rc)));
     childWriteLiteral("\n");
     linux.exit(127);
 }
@@ -583,12 +776,25 @@ fn childDropPrivileges(uid: u32, gid: u32) void {
     _ = linux.capset(&header, &data[0]);
 }
 
+fn childDropCapabilities() void {
+    const linux = std.os.linux;
+    var header = linux.cap_user_header_t{
+        .version = linux_capability_version_3,
+        .pid = 0,
+    };
+    const data = [_]linux.cap_user_data_t{
+        .{ .effective = 0, .permitted = 0, .inheritable = 0 },
+        .{ .effective = 0, .permitted = 0, .inheritable = 0 },
+    };
+    _ = linux.capset(&header, &data[0]);
+}
+
 fn childDup2(old: std.posix.fd_t, new: std.posix.fd_t) void {
     childSyscallName(std.os.linux.dup2(old, new), "dup2");
 }
 
 fn childClose(fd: std.posix.fd_t) void {
-    while (true) switch (std.posix.errno(std.os.linux.close(fd))) {
+    while (true) switch (linuxErrno(std.os.linux.close(fd))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -600,7 +806,7 @@ fn childCloseExtraFdsFrom(first_fd: std.posix.fd_t) void {
         .UNSHARE = true,
         .CLOEXEC = false,
     });
-    switch (std.posix.errno(rc)) {
+    switch (linuxErrno(rc)) {
         .SUCCESS, .NOSYS, .INVAL, .PERM => return,
         else => return,
     }
@@ -619,7 +825,7 @@ fn childWriteFile(path: [*:0]const u8, bytes: []const u8) void {
     var offset: usize = 0;
     while (offset < bytes.len) {
         const rc = linux.write(fd, bytes[offset..].ptr, bytes.len - offset);
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => {
                 const n: usize = @intCast(rc);
                 if (n == 0) linux.exit(127);
@@ -633,12 +839,19 @@ fn childWriteFile(path: [*:0]const u8, bytes: []const u8) void {
 }
 
 fn childSyscall(rc: usize) void {
-    if (std.posix.errno(rc) != .SUCCESS) std.os.linux.exit(127);
+    if (linuxErrno(rc) != .SUCCESS) std.os.linux.exit(127);
+}
+
+fn linuxErrno(rc: usize) std.os.linux.E {
+    return std.os.linux.errno(rc);
 }
 
 fn childSyscallName(rc: usize, comptime name: []const u8) void {
-    if (std.posix.errno(rc) == .SUCCESS) return;
-    childWriteLiteral("actiond child setup failed: " ++ name ++ "\n");
+    const err = linuxErrno(rc);
+    if (err == .SUCCESS) return;
+    childWriteLiteral("actiond child setup failed: " ++ name ++ " ");
+    childWriteBytes(@tagName(err));
+    childWriteLiteral("\n");
     std.os.linux.exit(127);
 }
 
@@ -652,7 +865,7 @@ fn childWriteBytes(bytes: []const u8) void {
 
 fn linuxPipe() ![2]std.posix.fd_t {
     var fds: [2]std.posix.fd_t = undefined;
-    switch (std.posix.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true }))) {
+    switch (linuxErrno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true }))) {
         .SUCCESS => return fds,
         .NFILE, .MFILE => return error.SystemResources,
         else => return error.Unexpected,
@@ -665,7 +878,7 @@ fn closePipe(pipe: [2]std.posix.fd_t) void {
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
-    while (true) switch (std.posix.errno(std.os.linux.close(fd))) {
+    while (true) switch (linuxErrno(std.os.linux.close(fd))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -733,7 +946,7 @@ fn collectChildResult(
         }
 
         const rc = std.os.linux.poll(&poll_fds, poll_fds.len, child_poll_timeout_ms);
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
             else => return error.Unexpected,
@@ -783,7 +996,7 @@ fn readSetupSignal(fd: std.posix.fd_t) !bool {
     var byte: [1]u8 = undefined;
     while (true) {
         const rc = std.os.linux.read(fd, byte[0..].ptr, byte.len);
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => return rc == 1,
             .INTR => continue,
             else => return error.Unexpected,
@@ -798,7 +1011,7 @@ fn readPipeChunk(
 ) !bool {
     var buffer: [16 * 1024]u8 = undefined;
     const rc = std.os.linux.read(fd, buffer[0..].ptr, buffer.len);
-    switch (std.posix.errno(rc)) {
+    switch (linuxErrno(rc)) {
         .SUCCESS => {
             const n: usize = @intCast(rc);
             if (n == 0) return true;
@@ -819,7 +1032,7 @@ fn waitForPid(pid: std.os.linux.pid_t) !Status {
     var raw_status: u32 = 0;
     while (true) {
         const rc = std.os.linux.waitpid(pid, &raw_status, 0);
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => break,
             .INTR => continue,
             else => return error.Unexpected,
@@ -833,7 +1046,7 @@ fn waitForPidNoHang(pid: std.os.linux.pid_t) !?Status {
     var raw_status: u32 = 0;
     while (true) {
         const rc = std.os.linux.waitpid(pid, &raw_status, std.os.linux.W.NOHANG);
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return null;
                 break;
@@ -929,6 +1142,11 @@ test "action namespace flags isolate mounts and networking" {
     const flags = actionNamespaceFlags();
     try std.testing.expect((flags & linux.CLONE.NEWNS) != 0);
     try std.testing.expect((flags & linux.CLONE.NEWNET) != 0);
+}
+
+test "linuxErrno decodes raw Linux syscall errors" {
+    const rc: usize = @bitCast(@as(isize, -@as(isize, @intFromEnum(std.os.linux.E.NETUNREACH))));
+    try std.testing.expectEqual(std.os.linux.E.NETUNREACH, linuxErrno(rc));
 }
 
 test "runCommandWithOptions rejects chroot execution on non-Linux hosts" {

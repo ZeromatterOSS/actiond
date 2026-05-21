@@ -103,7 +103,7 @@ fn mountSquashfs(
         std.os.linux.MS.RDONLY | std.os.linux.MS.NOSUID | std.os.linux.MS.NODEV,
         0,
     );
-    switch (std.posix.errno(rc)) {
+    switch (linuxErrno(rc)) {
         .SUCCESS => {},
         else => {
             clearLoopFd(loop_device.fd);
@@ -127,7 +127,7 @@ fn attachLoopReadOnly(allocator: std.mem.Allocator, image_path: []const u8) !Att
         .ACCMODE = .RDONLY,
         .CLOEXEC = true,
     }, 0);
-    switch (std.posix.errno(backing_rc)) {
+    switch (linuxErrno(backing_rc)) {
         .SUCCESS => {},
         else => return error.FileNotFound,
     }
@@ -139,7 +139,7 @@ fn attachLoopReadOnly(allocator: std.mem.Allocator, image_path: []const u8) !Att
         .ACCMODE = .RDWR,
         .CLOEXEC = true,
     }, 0);
-    switch (std.posix.errno(control_rc)) {
+    switch (linuxErrno(control_rc)) {
         .SUCCESS => {},
         else => return error.LoopDeviceUnavailable,
     }
@@ -150,7 +150,7 @@ fn attachLoopReadOnly(allocator: std.mem.Allocator, image_path: []const u8) !Att
     var attempts: usize = 0;
     while (attempts < max_loop_attach_attempts) : (attempts += 1) {
         const number_rc = std.os.linux.ioctl(control_fd, loop_ctl_get_free, 0);
-        switch (std.posix.errno(number_rc)) {
+        switch (linuxErrno(number_rc)) {
             .SUCCESS => {},
             else => return error.LoopDeviceUnavailable,
         }
@@ -162,7 +162,7 @@ fn attachLoopReadOnly(allocator: std.mem.Allocator, image_path: []const u8) !Att
             .ACCMODE = .RDWR,
             .CLOEXEC = true,
         }, 0);
-        switch (std.posix.errno(loop_rc)) {
+        switch (linuxErrno(loop_rc)) {
             .SUCCESS => {},
             .BUSY => {
                 allocator.free(loop_path);
@@ -178,7 +178,7 @@ fn attachLoopReadOnly(allocator: std.mem.Allocator, image_path: []const u8) !Att
         errdefer closeFd(loop_fd);
 
         const set_fd_rc = std.os.linux.ioctl(loop_fd, loop_set_fd, @intCast(backing_fd));
-        switch (std.posix.errno(set_fd_rc)) {
+        switch (linuxErrno(set_fd_rc)) {
             .SUCCESS => {},
             .BUSY => {
                 closeFd(loop_fd);
@@ -198,7 +198,7 @@ fn attachLoopReadOnly(allocator: std.mem.Allocator, image_path: []const u8) !Att
         @memcpy(info.lo_file_name[0..copy_len], image_path[0..copy_len]);
 
         const status_rc = std.os.linux.ioctl(loop_fd, loop_set_status64, @intFromPtr(&info));
-        switch (std.posix.errno(status_rc)) {
+        switch (linuxErrno(status_rc)) {
             .SUCCESS => {},
             else => {
                 clearLoopFd(loop_fd);
@@ -223,11 +223,15 @@ fn clearLoopFd(loop_fd: std.posix.fd_t) void {
 
 fn closeFd(fd: std.posix.fd_t) void {
     if (comptime builtin.os.tag != .linux) return;
-    while (true) switch (std.posix.errno(std.os.linux.close(fd))) {
+    while (true) switch (linuxErrno(std.os.linux.close(fd))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
     };
+}
+
+fn linuxErrno(rc: usize) std.os.linux.E {
+    return std.os.linux.errno(rc);
 }
 
 test "prepare rejects conflicting runtime sources" {

@@ -28,6 +28,64 @@ const max_output_file_bytes = 1024 * 1024 * 1024;
 const chroot_execroot_prefix = "/workspace/";
 const worker_name = "actiond";
 const supported_libc_runtimes = [_][]const u8{ "glibc2.31", "glibc2.35", "glibc2.39" };
+const rootless_host_tools = [_][]const u8{
+    "/usr/bin/awk",
+    "/usr/bin/basename",
+    "/usr/bin/bash",
+    "/usr/bin/cat",
+    "/usr/bin/cp",
+    "/usr/bin/dash",
+    "/usr/bin/dirname",
+    "/usr/bin/env",
+    "/usr/bin/find",
+    "/usr/bin/grep",
+    "/usr/bin/ln",
+    "/usr/bin/mawk",
+    "/usr/bin/mkdir",
+    "/usr/bin/rm",
+    "/usr/bin/sed",
+    "/usr/bin/sh",
+    "/usr/bin/sort",
+    "/usr/bin/tr",
+    "/usr/bin/xargs",
+};
+const rootless_host_libraries_x86_64 = [_][]const u8{
+    "/lib/x86_64-linux-gnu/libacl.so.1",
+    "/lib/x86_64-linux-gnu/libattr.so.1",
+    "/lib/x86_64-linux-gnu/libc.so.6",
+    "/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/lib/x86_64-linux-gnu/libdl.so.2",
+    "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+    "/lib/x86_64-linux-gnu/libm.so.6",
+    "/lib/x86_64-linux-gnu/libpcre2-8.so.0",
+    "/lib/x86_64-linux-gnu/libpthread.so.0",
+    "/lib/x86_64-linux-gnu/libresolv.so.2",
+    "/lib/x86_64-linux-gnu/librt.so.1",
+    "/lib/x86_64-linux-gnu/libselinux.so.1",
+    "/lib/x86_64-linux-gnu/libstdc++.so.6",
+    "/lib/x86_64-linux-gnu/libtinfo.so.6",
+    "/lib/x86_64-linux-gnu/libz.so.1",
+    "/lib64/ld-linux-x86-64.so.2",
+};
+const rootless_host_libraries_aarch64 = [_][]const u8{
+    "/lib/aarch64-linux-gnu/libacl.so.1",
+    "/lib/aarch64-linux-gnu/libattr.so.1",
+    "/lib/aarch64-linux-gnu/libc.so.6",
+    "/lib/aarch64-linux-gnu/libcrypto.so.3",
+    "/lib/aarch64-linux-gnu/libdl.so.2",
+    "/lib/aarch64-linux-gnu/libgcc_s.so.1",
+    "/lib/aarch64-linux-gnu/libm.so.6",
+    "/lib/aarch64-linux-gnu/libpcre2-8.so.0",
+    "/lib/aarch64-linux-gnu/libpthread.so.0",
+    "/lib/aarch64-linux-gnu/libresolv.so.2",
+    "/lib/aarch64-linux-gnu/librt.so.1",
+    "/lib/aarch64-linux-gnu/libselinux.so.1",
+    "/lib/aarch64-linux-gnu/libstdc++.so.6",
+    "/lib/aarch64-linux-gnu/libtinfo.so.6",
+    "/lib/aarch64-linux-gnu/libz.so.1",
+    "/lib/ld-linux-aarch64.so.1",
+    "/lib64/ld-linux-aarch64.so.1",
+};
 
 pub const RuntimeMountSources = struct {
     lib: ?[:0]const u8 = null,
@@ -69,6 +127,7 @@ pub const RuntimeMountCache = struct {
 pub const ExecuteOptions = struct {
     runtime_root_path: ?[]const u8 = null,
     use_actiondfs: bool = false,
+    isolation_mode: action_runner.LinuxIsolationMode = .privileged,
     cas_blob_root_path: ?[]const u8 = null,
     input_cas_blob_root_path: ?[]const u8 = null,
     staged_cas_blob_root_path: ?[]const u8 = null,
@@ -199,7 +258,7 @@ fn openAbsoluteBlobPathLinuxRetry(path: [:0]const u8) !std.Io.File {
     var stale_attempts: usize = 0;
     while (true) {
         const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => return .{ .handle = @intCast(rc), .flags = .{ .nonblocking = false } },
             .INTR => continue,
             .STALE => {
@@ -247,7 +306,11 @@ fn sleepShortRetry() void {
         .sec = 0,
         .nsec = 2 * std.time.ns_per_ms,
     };
-    while (std.posix.errno(std.os.linux.nanosleep(&request, &request)) == .INTR) {}
+    while (linuxErrno(std.os.linux.nanosleep(&request, &request)) == .INTR) {}
+}
+
+fn linuxErrno(rc: usize) std.os.linux.E {
+    return std.os.linux.errno(rc);
 }
 
 pub fn executeActionWithOptions(
@@ -417,23 +480,25 @@ pub fn executeActionWithOptions(
 
     var bind_mounts: std.ArrayListUnmanaged(action_runner.BindMount) = .empty;
     const borrowed_bind_mount_count = materialization.bind_mounts.len;
-    var runtime_mount_sources_are_borrowed = false;
+    var borrowed_runtime_source_start = borrowed_bind_mount_count;
+    var borrowed_runtime_source_end = borrowed_bind_mount_count;
     defer {
-        for (bind_mounts.items[borrowed_bind_mount_count..]) |mount| {
-            if (!runtime_mount_sources_are_borrowed) allocator.free(mount.source);
+        for (bind_mounts.items[borrowed_bind_mount_count..], borrowed_bind_mount_count..) |mount, i| {
+            if (i < borrowed_runtime_source_start or i >= borrowed_runtime_source_end) allocator.free(mount.source);
             allocator.free(mount.target);
         }
         bind_mounts.deinit(allocator);
     }
     try bind_mounts.appendSlice(allocator, materialization.bind_mounts);
     if (options.runtime_mount_cache) |cache| {
-        runtime_mount_sources_are_borrowed = true;
+        borrowed_runtime_source_start = bind_mounts.items.len;
         if (libc_runtime) |libc| {
             const sources = cache.forLibc(libc) orelse return error.UnsupportedLibcRuntime;
             try appendCachedLibcRuntimeMounts(io, allocator, work_root, work_root_path, sources, &bind_mounts);
         } else {
             try appendCachedCommonRuntimeMounts(io, allocator, work_root, work_root_path, &cache.common, &bind_mounts);
         }
+        borrowed_runtime_source_end = bind_mounts.items.len;
     } else {
         if (options.runtime_root_path) |runtime_root| {
             if (libc_runtime == null) {
@@ -444,6 +509,9 @@ pub fn executeActionWithOptions(
             const runtime_root = options.runtime_root_path orelse return error.MissingRuntimeRoot;
             try appendLibcRuntimeMounts(io, allocator, work_root, work_root_path, runtime_root, libc, &bind_mounts);
         }
+    }
+    if (isRootless(options.isolation_mode)) {
+        try appendRootlessHostCompatibilityMounts(io, allocator, work_root, work_root_path, &bind_mounts);
     }
 
     const input_fetch_completed_wall = timestampNow(io);
@@ -457,6 +525,7 @@ pub fn executeActionWithOptions(
         .bind_mounts = bind_mounts.items,
         .actiondfs_mounts = if (actiondfs_workspace) |*workspace| workspace.mounts[0..] else &.{},
         .cgroup_limits = action_runner.CgroupLimits.fromPlatform(action.platform),
+        .isolation_mode = options.isolation_mode,
     });
     errdefer outcome.deinit(allocator);
     const execution_completed_wall = timestampNow(io);
@@ -859,7 +928,7 @@ const ActiondfsWorkspace = struct {
             linux.MS.RDONLY | linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOATIME,
             @intFromPtr(self.actiondfs_data.ptr),
         );
-        switch (std.posix.errno(actiondfs_rc)) {
+        switch (linuxErrno(actiondfs_rc)) {
             .SUCCESS => {},
             else => return error.MountFailed,
         }
@@ -872,7 +941,7 @@ const ActiondfsWorkspace = struct {
             linux.MS.NOSUID | linux.MS.NODEV,
             @intFromPtr(self.overlay_data.ptr),
         );
-        switch (std.posix.errno(overlay_rc)) {
+        switch (linuxErrno(overlay_rc)) {
             .SUCCESS => {},
             else => return error.MountFailed,
         }
@@ -1000,6 +1069,13 @@ fn appendCachedLibcRuntimeMounts(
     if (sources.etc) |source| try appendCachedRuntimeMount(io, allocator, chroot_dir, chroot_path, source, "etc", bind_mounts);
 }
 
+fn isRootless(mode: action_runner.LinuxIsolationMode) bool {
+    return switch (mode) {
+        .privileged => false,
+        .rootless => true,
+    };
+}
+
 fn appendCachedRuntimeMount(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1014,6 +1090,77 @@ fn appendCachedRuntimeMount(
     errdefer allocator.free(target);
     try bind_mounts.append(allocator, .{
         .source = @constCast(source),
+        .target = target,
+    });
+}
+
+fn appendRootlessHostCompatibilityMounts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    chroot_dir: std.Io.Dir,
+    chroot_path: []const u8,
+    bind_mounts: *std.ArrayListUnmanaged(action_runner.BindMount),
+) !void {
+    for (&rootless_host_tools) |mount| {
+        try appendHostFileMountIfExists(io, allocator, chroot_dir, chroot_path, mount, bind_mounts);
+    }
+    for (rootlessHostLibraryPaths()) |mount| {
+        try appendHostFileMountIfExists(io, allocator, chroot_dir, chroot_path, mount, bind_mounts);
+    }
+    try ensureSymlinkIfMissing(io, chroot_dir, "usr/bin", "bin");
+    try ensureSymlinkIfMissing(io, chroot_dir, "usr/sbin", "sbin");
+}
+
+fn rootlessHostLibraryPaths() []const []const u8 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => &rootless_host_libraries_x86_64,
+        .aarch64 => &rootless_host_libraries_aarch64,
+        else => &.{},
+    };
+}
+
+fn ensureSymlinkIfMissing(
+    io: std.Io,
+    chroot_dir: std.Io.Dir,
+    target_path: []const u8,
+    link_path: []const u8,
+) !void {
+    chroot_dir.access(io, link_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try chroot_dir.symLink(io, target_path, link_path, .{ .is_directory = true });
+            return;
+        },
+        else => |e| return e,
+    };
+}
+
+fn appendHostFileMountIfExists(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    chroot_dir: std.Io.Dir,
+    chroot_path: []const u8,
+    source_path: []const u8,
+    bind_mounts: *std.ArrayListUnmanaged(action_runner.BindMount),
+) !void {
+    std.Io.Dir.cwd().access(io, source_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+
+    const target_rel = if (std.mem.startsWith(u8, source_path, "/")) source_path[1..] else source_path;
+    if (std.fs.path.dirname(target_rel)) |parent| try chroot_dir.createDirPath(io, parent);
+    var file = chroot_dir.createFile(io, target_rel, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => try chroot_dir.openFile(io, target_rel, .{ .mode = .write_only }),
+        else => |e| return e,
+    };
+    file.close(io);
+
+    const source = try allocator.dupeZ(u8, source_path);
+    errdefer allocator.free(source);
+    const target = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ chroot_path, target_rel }, 0);
+    errdefer allocator.free(target);
+    try bind_mounts.append(allocator, .{
+        .source = source,
         .target = target,
     });
 }
@@ -2410,4 +2557,11 @@ test "prepareChrootBaseDirs creates temporary directories" {
     try prepareChrootBaseDirs(std.testing.io, work_dir);
     try work_dir.access(std.testing.io, "tmp", .{});
     try work_dir.access(std.testing.io, "var/tmp", .{});
+}
+
+test "rootless host compatibility libraries match supported Linux arches" {
+    switch (builtin.cpu.arch) {
+        .x86_64, .aarch64 => try std.testing.expect(rootlessHostLibraryPaths().len > 0),
+        else => try std.testing.expectEqual(@as(usize, 0), rootlessHostLibraryPaths().len),
+    }
 }

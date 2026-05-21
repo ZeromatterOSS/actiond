@@ -363,6 +363,8 @@ fn prepareZstdBootFile(
 }
 
 fn decompressZstdAlloc(allocator: std.mem.Allocator, compressed: []const u8, max_raw_bytes: u64) ![]u8 {
+    if (comptime builtin.os.tag != .macos) return error.UnsupportedHost;
+
     const content_size = zstd.ZSTD_getFrameContentSize(compressed.ptr, compressed.len);
     if (content_size == zstdContentSizeError()) return error.InvalidCompressedBootArtifact;
     if (content_size == zstdContentSizeUnknown()) return error.UnknownCompressedBootArtifactSize;
@@ -462,6 +464,8 @@ test "prepareBootInitramfs leaves raw initramfs paths unchanged" {
 }
 
 test "prepareBootKernel inflates zstd payloads without relying on filename suffix" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -494,6 +498,8 @@ test "isZstdFrame detects zstd magic" {
 }
 
 test "decompressZstdAlloc inflates libzstd frames" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+
     const plain = "initramfs payload";
     const compressed = try compressZstdForTest(std.testing.allocator, plain);
     defer std.testing.allocator.free(compressed);
@@ -504,6 +510,8 @@ test "decompressZstdAlloc inflates libzstd frames" {
 }
 
 fn compressZstdForTest(allocator: std.mem.Allocator, plain: []const u8) ![]u8 {
+    if (comptime builtin.os.tag != .macos) return error.UnsupportedHost;
+
     const bound = zstd.ZSTD_compressBound(plain.len);
     if (zstd.ZSTD_isError(bound) != 0) return error.ZstdCompressBoundFailed;
 

@@ -298,7 +298,7 @@ fn openBlobPathLinuxRetry(path: [:0]const u8) !std.Io.File {
     var stale_attempts: usize = 0;
     while (true) {
         const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => return .{ .handle = @intCast(rc), .flags = .{ .nonblocking = false } },
             .INTR => continue,
             .STALE => {
@@ -328,7 +328,11 @@ fn sleepStaleRetry() void {
         .sec = 0,
         .nsec = 2 * std.time.ns_per_ms,
     };
-    while (std.posix.errno(std.os.linux.nanosleep(&request, &request)) == .INTR) {}
+    while (linuxErrno(std.os.linux.nanosleep(&request, &request)) == .INTR) {}
+}
+
+fn linuxErrno(rc: usize) std.os.linux.E {
+    return std.os.linux.errno(rc);
 }
 
 fn readFd(fd: std.Io.File.Handle, buffer: []u8) !usize {
