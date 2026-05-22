@@ -16,6 +16,13 @@ platform_transition_binary(
     target_platform = "//platforms:linux_aarch64",
 )
 
+platform_transition_binary(
+    name = "linux-actiond-guest-x86_64-raw",
+    basename = "linux-actiond-guest-x86_64-raw",
+    binary = ":linux-actiond-guest",
+    target_platform = "//platforms:linux_x86_64",
+)
+
 genrule(
     name = "linux-actiond-guest-aarch64",
     outs = ["linux-actiond-guest-aarch64.bin"],
@@ -29,6 +36,24 @@ chmod +x "$@"
     executable = True,
     tools = [
         ":linux-actiond-guest-aarch64-raw",
+        "@llvm//tools:llvm-strip",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "linux-actiond-guest-x86_64",
+    outs = ["linux-actiond-guest-x86_64.bin"],
+    cmd = """
+set -euo pipefail
+cp "$(execpath :linux-actiond-guest-x86_64-raw)" "$@"
+chmod +w "$@"
+"$(execpath @llvm//tools:llvm-strip)" --strip-all "$@"
+chmod +x "$@"
+    """,
+    executable = True,
+    tools = [
+        ":linux-actiond-guest-x86_64-raw",
         "@llvm//tools:llvm-strip",
     ],
     visibility = ["//visibility:public"],

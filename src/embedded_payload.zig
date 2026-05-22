@@ -22,6 +22,8 @@ const segment_command_64_len = 72;
 const mach_o_section_64_len = 80;
 
 const elf_runtimes_section = ".actiond.runtimes";
+const elf_kernel_section = ".actiond.kernel";
+const elf_initramfs_section = ".actiond.initramfs";
 
 const Range = struct {
     offset: u64,
@@ -65,10 +67,17 @@ fn findPayloadSection(
         if (try findMachOSection(io, executable, mach_o_segment_name, section_name)) |range| return range;
     }
 
-    if (std.mem.eql(u8, name, runtimes_name)) {
-        if (try findElfSection(io, allocator, executable, elf_runtimes_section)) |range| return range;
+    if (elfSectionNameForPayload(name)) |section_name| {
+        if (try findElfSection(io, allocator, executable, section_name)) |range| return range;
     }
 
+    return null;
+}
+
+fn elfSectionNameForPayload(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, kernel_name)) return elf_kernel_section;
+    if (std.mem.eql(u8, name, initramfs_name)) return elf_initramfs_section;
+    if (std.mem.eql(u8, name, runtimes_name)) return elf_runtimes_section;
     return null;
 }
 

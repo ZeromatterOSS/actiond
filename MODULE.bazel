@@ -137,6 +137,10 @@ linux_kernel.kconfig(
     name = "actiond_vm_kconfig",
     config = "//vm:linux.config",
 )
+linux_kernel.kconfig(
+    name = "actiond_vm_x86_64_kconfig",
+    config = "//vm:linux_x86_64.config",
+)
 linux_kernel.compact(
     name = "actiond_vm_compact",
     config = "//vm:linux.config",
@@ -147,9 +151,21 @@ linux_kernel.compact(
     kernel_package = "vm",
     source_repo = "linux_6_18_2",
 )
+linux_kernel.compact(
+    name = "actiond_vm_x86_64_compact",
+    config = "//vm:linux_x86_64.config",
+    config_mode = "allnoconfig",
+    config_name = "x86_64",
+    extra_sources = ["actiondfs"],
+    kernel_name = "linux_kernel_x86_64",
+    kernel_package = "vm",
+    source_repo = "linux_6_18_2",
+)
 use_repo(
     linux_kernel,
     "actiond_vm_compact",
+    "actiond_vm_x86_64_compact",
+    "actiond_vm_x86_64_kconfig",
     "actiond_vm_kconfig",
     "linux_6_18_2",
 )
