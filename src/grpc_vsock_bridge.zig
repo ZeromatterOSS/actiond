@@ -1,10 +1,8 @@
 const std = @import("std");
-const darwin_vm = @import("darwin_vm.zig");
 const vsock = @import("vsock.zig");
 
 pub const Error = error{
     InvalidListenAddress,
-    UnsupportedHost,
 };
 
 const pump_buffer_len = 64 * 1024;
@@ -22,10 +20,8 @@ const PumpStats = struct {
 pub fn serve(
     io: std.Io,
     listen: []const u8,
-    machine: *darwin_vm.Machine,
+    machine: anytype,
 ) !void {
-    if (comptime @import("builtin").os.tag != .macos) return error.UnsupportedHost;
-
     const address = try parseListenAddress(listen);
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -48,7 +44,7 @@ pub fn serve(
     }
 }
 
-fn connectionThread(io: std.Io, machine: *darwin_vm.Machine, client_fd: std.posix.fd_t) void {
+fn connectionThread(io: std.Io, machine: anytype, client_fd: std.posix.fd_t) void {
     defer closeFd(client_fd);
     const started = std.Io.Clock.awake.now(io);
 

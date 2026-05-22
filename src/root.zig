@@ -25,12 +25,14 @@ pub const http2_frame = @import("http2_frame.zig");
 pub const http2_header = @import("http2_header.zig");
 pub const http2_hpack = @import("http2_hpack.zig");
 pub const protobuf_wire = @import("protobuf_wire.zig");
+pub const qemu_vm = @import("qemu_vm.zig");
 pub const reapi = @import("reapi.zig");
 pub const reapi_dispatch = @import("reapi_dispatch.zig");
 pub const runtime_mount = @import("runtime_mount.zig");
 pub const staged_cas_index = @import("staged_cas_index.zig");
 pub const tree_service = @import("tree_service.zig");
 pub const version = @import("version.zig");
+pub const vm_host = @import("vm_host.zig");
 pub const vsock = @import("vsock.zig");
 
 test {
@@ -61,11 +63,13 @@ test {
     _ = http2_header;
     _ = http2_hpack;
     _ = protobuf_wire;
+    _ = qemu_vm;
     _ = reapi;
     _ = reapi_dispatch;
     _ = runtime_mount;
     _ = staged_cas_index;
     _ = tree_service;
     _ = version;
+    _ = vm_host;
     _ = vsock;
 }

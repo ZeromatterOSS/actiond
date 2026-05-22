@@ -8,6 +8,7 @@ warmup_target="${ACTIOND_LLVM_SMOKE_WARMUP_TARGET-//e2e:llvm_exec_warmup}"
 target_platform="${ACTIOND_LLVM_SMOKE_TARGET_PLATFORM:-@llvm//platforms:linux_arm64_musl}"
 # LLVM host tools are built for the VM, not for the macOS launcher.
 host_platform="${ACTIOND_LLVM_SMOKE_HOST_PLATFORM:-${target_platform}}"
+exec_platform="${ACTIOND_LLVM_SMOKE_EXEC_PLATFORM:-//e2e:actiond_linux_arm64_musl_exec}"
 executor="${ACTIOND_LLVM_SMOKE_EXECUTOR:-grpc://127.0.0.1:8998}"
 cache="${ACTIOND_LLVM_SMOKE_CACHE:-${executor}}"
 jobs="${ACTIOND_LLVM_SMOKE_JOBS-}"
@@ -35,7 +36,7 @@ build_remote() {
     "${build_mode_flags[@]}"
     --platforms="${target_platform}"
     --host_platform="${host_platform}"
-    --extra_execution_platforms=//e2e:actiond_linux_arm64_musl_exec
+    --extra_execution_platforms="${exec_platform}"
     --remote_executor="${executor}"
     --remote_cache="${cache}"
     --experimental_remote_downloader=

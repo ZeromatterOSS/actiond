@@ -12,18 +12,25 @@ genrule(
     name = "linux-actiond-standalone_pkg",
     srcs = [
         ":linux-actiond",
-        "//runtimes:runtimes_squashfs",
+        "//runtimes:runtimes_squashfs_x86_64",
+        "//vm:initramfs_x86_64",
+        "//vm:linux_kernel_x86_64_zst",
     ],
     outs = ["linux-actiond-standalone"],
     cmd = """
 set -euo pipefail
 cp "$(location :linux-actiond)" "$@"
 chmod +w "$@"
-"$(execpath @llvm//tools:llvm-objcopy)" --add-section .actiond.runtimes="$(location //runtimes:runtimes_squashfs)" "$@"
+"$(execpath @llvm//tools:llvm-objcopy)" --add-section .actiond.runtimes="$(location //runtimes:runtimes_squashfs_x86_64)" "$@"
+"$(execpath @llvm//tools:llvm-objcopy)" --add-section .actiond.kernel="$(location //vm:linux_kernel_x86_64_zst)" "$@"
+"$(execpath @llvm//tools:llvm-objcopy)" --add-section .actiond.initramfs="$(location //vm:initramfs_x86_64)" "$@"
 chmod +x "$@"
 """,
     executable = True,
-    target_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
     tools = ["@llvm//tools:llvm-objcopy"],
     visibility = ["//visibility:public"],
 )

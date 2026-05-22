@@ -6,11 +6,12 @@ test_workspace="${repo_root}/test"
 
 usage() {
   cat >&2 <<'EOF'
-usage: tools/e2e.sh <build|linux|vm|all>
+usage: tools/e2e.sh <build|linux|linux-vm|vm|all>
 
 Modes:
   build   Run repository build/test checks and build the stress action tools.
   linux   Start linux-actiond on this Linux host and run test/ via Bazel remote execution.
+  linux-vm Start linux-actiond serve-vm with QEMU/KVM and run test/ via Bazel remote execution.
   vm      Start darwin-actiond serve-vm and run test/ via Bazel remote execution.
   all     Run build plus the host-appropriate e2e mode when configured.
 
@@ -21,6 +22,11 @@ Environment:
   ACTIOND_VM_CPUS=4
   ACTIOND_VM_CAS_IMAGE=/path/to/cas.ext4
   ACTIOND_VM_CAS_IMAGE_SIZE_MIB=8192
+  ACTIOND_VM_QEMU=qemu-system-x86_64
+  ACTIOND_VM_GUEST_CID=42
+  ACTIOND_VM_ALLOW_TCG=1
+  ACTIOND_VM_QEMU_CACHE=none
+  ACTIOND_VM_QEMU_AIO=io_uring
   ACTIOND_E2E_BARE_COUNT=160
   ACTIOND_E2E_SOURCE_DIRS=8
   ACTIOND_E2E_SOURCE_FILES_PER_DIR=32
@@ -29,6 +35,7 @@ Environment:
   ACTIOND_E2E_STANDALONE=1
   ACTIOND_E2E_JOBS=8
   ACTIOND_REPO_BAZEL_FLAGS="--config=remote"
+  ACTIOND_E2E_LIBC=glibc2.35
   ACTIOND_E2E_REMOTE_GRPC_LOG=/path/to/remote_grpc.log
   ACTIOND_E2E_ACTIONDFS_STATS_PATH=/path/to/actiondfs_stats.txt
 EOF
@@ -38,6 +45,7 @@ e2e_host="${ACTIOND_E2E_HOST:-127.0.0.1}"
 e2e_port="${ACTIOND_E2E_PORT:-8980}"
 endpoint="${e2e_host}:${e2e_port}"
 e2e_server_pid=""
+e2e_server_process_group=0
 e2e_root=""
 e2e_log=""
 e2e_log_label="actiond log"
@@ -61,7 +69,13 @@ cleanup_e2e_server() {
     tail -200 "${ACTIOND_E2E_ACTIONDFS_STATS_PATH}" >&2 || true
   fi
   if [[ -n "${e2e_server_pid}" ]]; then
-    kill "${e2e_server_pid}" >/dev/null 2>&1 || true
+    if [[ "${e2e_server_process_group}" == "1" ]]; then
+      kill -TERM -- "-${e2e_server_pid}" >/dev/null 2>&1 || true
+      sleep 0.2
+      kill -KILL -- "-${e2e_server_pid}" >/dev/null 2>&1 || true
+    else
+      kill "${e2e_server_pid}" >/dev/null 2>&1 || true
+    fi
     wait "${e2e_server_pid}" >/dev/null 2>&1 || true
   fi
   if [[ -n "${e2e_root}" && "$(uname -s)" == "Linux" ]]; then
@@ -80,6 +94,7 @@ cleanup_e2e_server() {
     fi
   fi
   e2e_server_pid=""
+  e2e_server_process_group=0
   e2e_root=""
   e2e_log=""
 }
@@ -142,6 +157,37 @@ wait_for_port() {
   done
 }
 
+check_e2e_server_running() {
+  if [[ -z "${e2e_server_pid}" ]]; then
+    echo "e2e server was not started" >&2
+    return 1
+  fi
+  if ! kill -0 "${e2e_server_pid}" >/dev/null 2>&1; then
+    wait "${e2e_server_pid}" >/dev/null 2>&1 || true
+    echo "e2e server exited before the workload started" >&2
+    return 1
+  fi
+}
+
+wait_for_guest_ready() {
+  local stats_path="$1"
+  local timeout="${2:-120}"
+  local start
+  start="$(date +%s)"
+
+  while true; do
+    check_e2e_server_running
+    if [[ -s "${stats_path}" ]]; then
+      return 0
+    fi
+    if (( "$(date +%s)" - start >= timeout )); then
+      echo "timed out waiting for guest actiond readiness; stats path: ${stats_path}" >&2
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
 run_stress_workspace() {
   local -a remote_grpc_log_flags=()
   if [[ -n "${ACTIOND_E2E_REMOTE_GRPC_LOG:-}" ]]; then
@@ -161,6 +207,7 @@ run_stress_workspace() {
       --remote_local_fallback=false \
       --remote_upload_local_results=false \
       --remote_download_outputs=toplevel \
+      --remote_default_exec_properties=libc="${ACTIOND_E2E_LIBC:-glibc2.35}" \
       "${remote_grpc_log_flags[@]}" \
       --disk_cache= \
       --jobs="${ACTIOND_E2E_JOBS:-8}" \
@@ -206,7 +253,15 @@ run_linux_e2e() {
     server="$(bazel_output //cmd/linux_actiond:linux-actiond)"
     local runtimes
     runtimes="$(bazel_output //runtimes:runtimes_squashfs)"
-    server_args+=(--runtime-image="${runtimes}")
+    if [[ ! -r /dev/loop-control || ! -w /dev/loop-control ]]; then
+      local runtime_root
+      runtime_root="${root}/runtimes"
+      mkdir -p "${runtime_root}"
+      unsquashfs -quiet -f -d "${runtime_root}" "${runtimes}"
+      server_args+=(--runtime-root="${runtime_root}")
+    else
+      server_args+=(--runtime-image="${runtimes}")
+    fi
   fi
   local log="${root}/linux-actiond.log"
 
@@ -218,6 +273,85 @@ run_linux_e2e() {
   trap 'cleanup_e2e_server $?' EXIT
 
   wait_for_port "${e2e_host}" "${e2e_port}" 30
+  run_stress_workspace
+  cleanup_e2e_server 0
+  trap - EXIT
+}
+
+run_linux_vm_e2e() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "linux-vm e2e must run on Linux with QEMU/KVM" >&2
+    return 1
+  fi
+
+  local arch
+  arch="$(host_arch)"
+  if [[ "${arch}" != "x86_64" ]]; then
+    echo "linux-vm e2e currently requires an x86_64 Linux host" >&2
+    return 1
+  fi
+  prepare_stress_workspace "${arch}"
+
+  local server root log stats_path
+  local cas_image cas_image_size_mib
+  local -a server_args
+  root="$(mktemp -d "${TMPDIR:-/tmp}/actiond-linux-vm-e2e.XXXXXX")"
+  log="${root}/linux-actiond-vm.log"
+  stats_path="${root}/actiondfs_stats.txt"
+  cas_image="${ACTIOND_VM_CAS_IMAGE:-${root}/server/cas.ext4}"
+  cas_image_size_mib="${ACTIOND_VM_CAS_IMAGE_SIZE_MIB:-8192}"
+  "${repo_root}/tools/create_ext4_image.sh" "${cas_image}" "${cas_image_size_mib}"
+  server_args=(
+    --listen="${endpoint}"
+    --root="${root}/server"
+    --cas-image="${cas_image}"
+    --cas-image-size-mib="${cas_image_size_mib}"
+    --memory-mib="${ACTIOND_VM_MEMORY_MIB:-1024}"
+    --cpus="${ACTIOND_VM_CPUS:-4}"
+    --qemu="${ACTIOND_VM_QEMU:-qemu-system-x86_64}"
+    --guest-cid="${ACTIOND_VM_GUEST_CID:-42}"
+    --qemu-cache="${ACTIOND_VM_QEMU_CACHE:-none}"
+    --actiondfs-stats-path="${stats_path}"
+  )
+  if [[ -n "${ACTIOND_VM_QEMU_AIO:-}" ]]; then
+    server_args+=(--qemu-aio="${ACTIOND_VM_QEMU_AIO}")
+  fi
+  if [[ "${ACTIOND_VM_ALLOW_TCG:-0}" == "1" ]]; then
+    server_args+=(--allow-tcg)
+  fi
+
+  if [[ "${ACTIOND_E2E_STANDALONE:-0}" == "1" ]]; then
+    run_bazel build //cmd/linux_actiond:linux-actiond-standalone_pkg
+    server="$(bazel_output //cmd/linux_actiond:linux-actiond-standalone_pkg)"
+  else
+    run_bazel build \
+      //cmd/linux_actiond:linux-actiond \
+      //vm:linux_kernel_x86_64_zst \
+      //vm:initramfs_x86_64 \
+      //runtimes:runtimes_squashfs
+    local kernel initramfs runtimes
+    kernel="$(bazel_output //vm:linux_kernel_x86_64_zst)"
+    initramfs="$(bazel_output //vm:initramfs_x86_64)"
+    runtimes="$(bazel_output //runtimes:runtimes_squashfs)"
+    server="$(bazel_output //cmd/linux_actiond:linux-actiond)"
+    server_args+=(
+      --kernel="${kernel}"
+      --initramfs="${initramfs}"
+      --runtime-image="${runtimes}"
+    )
+  fi
+
+  setsid "${server}" serve-vm "${server_args[@]}" >"${log}" 2>&1 &
+  e2e_server_pid="$!"
+  e2e_server_process_group=1
+  e2e_root="${root}"
+  e2e_log="${log}"
+  e2e_log_label="linux-actiond QEMU VM log"
+  trap 'cleanup_e2e_server $?' EXIT
+
+  wait_for_port "${e2e_host}" "${e2e_port}" 90
+  check_e2e_server_running
+  wait_for_guest_ready "${stats_path}" 120
   run_stress_workspace
   cleanup_e2e_server 0
   trap - EXIT
@@ -291,6 +425,9 @@ case "${1:-}" in
     ;;
   linux)
     run_linux_e2e
+    ;;
+  linux-vm)
+    run_linux_vm_e2e
     ;;
   vm)
     run_vm_e2e

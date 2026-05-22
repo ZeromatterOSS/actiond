@@ -3,17 +3,19 @@
 `actiond` is a local Remote Execution API worker/cache for running Bazel
 actions in a Linux sandbox.
 
-It has two execution modes:
+It has three execution modes:
 
 - `linux-actiond`: runs actions directly on a Linux host using chroot, private
   mount/network namespaces, loopback-only TCP, read-only bind mounts, and
   best-effort cgroups.
 - `darwin-actiond serve-vm`: runs on macOS and proxies execution into a tiny
   Linux VM built with Apple's Virtualization.framework.
+- `linux-actiond serve-vm`: runs on Linux x86_64 and proxies execution into a
+  tiny Linux VM booted with QEMU/KVM.
 
-The macOS VM path is the main reason this project exists: it lets a Mac act
-like a local Linux remote-execution worker without giving actions normal macOS
-process access.
+The VM paths are the high-performance actiondfs paths: they let a host act like
+a local Linux remote-execution worker while actions run inside a guest with the
+custom actiondfs kernel.
 
 For deeper implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -22,8 +24,9 @@ For deeper implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 The repo is fully Bazelized:
 
 - Zig 0.16.0 binaries for macOS, Linux hosts, and the Linux VM guest.
-- A minimal arm64 Linux kernel from `http_archive`.
-- A compressed initramfs containing `linux-actiond-guest`.
+- Minimal arm64 and x86_64 Linux kernels from the archive declared in
+  `MODULE.bazel`.
+- Compressed initramfs images containing `linux-actiond-guest`.
 - Zstd-compressed SquashFS runtime images containing selected glibc versions.
 - Standalone binaries that embed their runtime artifacts.
 
@@ -36,15 +39,16 @@ bazel build //cmd/linux_actiond:linux-actiond-standalone \
 bazel build //cmd/linux_actiond:linux-actiond-standalone \
   --platforms=//platforms:linux_x86_64
 bazel build //vm:linux_kernel_zst //vm:initramfs //runtimes:runtimes_squashfs
+bazel build //vm:linux_kernel_x86_64_zst //vm:initramfs_x86_64 //runtimes:runtimes_squashfs_x86_64
 ```
 
-The Linux standalone target follows Bazel's target platform. Its embedded
-runtime image comes from `//runtimes:runtimes_squashfs`, which selects the
-matching runtime SquashFS for the target CPU.
+The direct Linux standalone target follows Bazel's target platform. The Linux
+QEMU VM standalone package is x86_64-only and embeds the x86_64 runtime,
+kernel, and initramfs artifacts.
 
 The VM kernel is built by `linux.bzl` from the Linux archive declared in
-`MODULE.bazel`. The repository currently uses a `local_path_override` for
-`linux.bzl` until the needed ruleset changes are published.
+`MODULE.bazel`. The repository applies a small x86_64 relocation-check patch to
+the upstream `linux.bzl` archive.
 
 ```bash
 bazel build //vm:linux_kernel_zst
@@ -105,6 +109,22 @@ when `--runtime-image` and `--runtime-root` are omitted.
 
 Linux execution requires the privileges needed for chroot, bind mounts, mount
 namespaces, and cgroups. The Docker e2e harness runs privileged for this reason.
+
+### Linux QEMU VM Worker
+
+On Linux x86_64 with KVM:
+
+```bash
+bazel build //cmd/linux_actiond:linux-actiond-standalone_pkg
+bazel-bin/cmd/linux_actiond/linux-actiond-standalone serve-vm \
+  --listen=127.0.0.1:8980 \
+  --root=/tmp/actiond-vm \
+  --cas-image=/tmp/actiond-vm/cas.ext4
+```
+
+The CAS image must be a writable ext4 image. The e2e and LLVM smoke runners
+create one with `tools/create_ext4_image.sh`; use the same helper when running
+the VM worker manually.
 
 ## Testing
 

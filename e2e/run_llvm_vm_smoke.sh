@@ -2,12 +2,29 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+host_os="$(uname -s)"
+if [[ "${host_os}" == "Linux" ]]; then
+  default_target_platform="@llvm//platforms:linux_x86_64_musl"
+  default_exec_platform="//e2e:actiond_linux_x86_64_musl_exec"
+  default_server_target="//cmd/linux_actiond:linux-actiond-standalone_pkg"
+  default_server_script_path="/tmp/linux-actiond-standalone"
+  default_run_mac_host=0
+  server_label="linux-actiond"
+else
+  default_target_platform="@llvm//platforms:linux_arm64_musl"
+  default_exec_platform="//e2e:actiond_linux_arm64_musl_exec"
+  default_server_target="//cmd/darwin_actiond:darwin-actiond-standalone_pkg"
+  default_server_script_path="/tmp/darwin-actiond-standalone"
+  default_run_mac_host=1
+  server_label="darwin-actiond"
+fi
 workspace="${ACTIOND_LLVM_SMOKE_WORKSPACE:-${repo_root}}"
 smoke_target="${ACTIOND_LLVM_SMOKE_TARGET:-@llvm-project//llvm:llvm-tblgen}"
 warmup_target="${ACTIOND_LLVM_SMOKE_WARMUP_TARGET-//e2e:llvm_exec_warmup}"
-target_platform="${ACTIOND_LLVM_SMOKE_TARGET_PLATFORM:-@llvm//platforms:linux_arm64_musl}"
+target_platform="${ACTIOND_LLVM_SMOKE_TARGET_PLATFORM:-${default_target_platform}}"
 # LLVM builds host-configured tools that execute remotely in the VM.
 host_platform="${ACTIOND_LLVM_SMOKE_HOST_PLATFORM:-${target_platform}}"
+exec_platform="${ACTIOND_LLVM_SMOKE_EXEC_PLATFORM:-${default_exec_platform}}"
 host="${ACTIOND_LLVM_VM_SMOKE_HOST:-127.0.0.1}"
 port="${ACTIOND_LLVM_VM_SMOKE_PORT:-8998}"
 endpoint="${host}:${port}"
@@ -27,14 +44,22 @@ output_root="${ACTIOND_LLVM_VM_SMOKE_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/actiond-
 cas_image="${ACTIOND_VM_CAS_IMAGE:-${output_root}/server/cas.ext4}"
 cas_image_size_mib="${ACTIOND_VM_CAS_IMAGE_SIZE_MIB:-8192}"
 run_vm="${ACTIOND_LLVM_SMOKE_VM:-1}"
-run_mac_host="${ACTIOND_LLVM_SMOKE_MAC_HOST:-1}"
-server_target="${ACTIOND_LLVM_SMOKE_SERVER_TARGET:-//cmd/darwin_actiond:darwin-actiond-standalone_pkg}"
-server_script_path="${ACTIOND_LLVM_SMOKE_SERVER_SCRIPT_PATH:-/tmp/darwin-actiond-standalone}"
+run_mac_host="${ACTIOND_LLVM_SMOKE_MAC_HOST:-${default_run_mac_host}}"
+server_target="${ACTIOND_LLVM_SMOKE_SERVER_TARGET:-${default_server_target}}"
+server_script_path="${ACTIOND_LLVM_SMOKE_SERVER_SCRIPT_PATH:-${default_server_script_path}}"
+qemu_path="${ACTIOND_LLVM_VM_SMOKE_QEMU:-${ACTIOND_VM_QEMU:-}}"
 build_mode_flags=(
   -c opt
   --strip=always
   --stripopt=--strip-all
 )
+server_build_mode_flags=("${build_mode_flags[@]}")
+if [[ "${host_os}" == "Linux" && "${ACTIOND_LLVM_SMOKE_OPT_SERVER:-0}" != "1" ]]; then
+  # linux.bzl's x86_64 bzImage currently boots under fastbuild but not under
+  # Bazel -c opt. Keep the measured LLVM workload opt-built while using a
+  # bootable Linux VM bundle for the QEMU host.
+  server_build_mode_flags=()
+fi
 bazel_build_flags=()
 if [[ -n "${ACTIOND_BAZEL_BUILD_FLAGS:-}" ]]; then
   read -r -a bazel_build_flags <<<"${ACTIOND_BAZEL_BUILD_FLAGS}"
@@ -42,19 +67,26 @@ fi
 
 server_pid=""
 server_log=""
+server_process_group=0
 
 cleanup_server() {
   local status="${1:-$?}"
   if [[ -n "${server_pid}" ]]; then
-    kill "${server_pid}" >/dev/null 2>&1 || true
+    if [[ "${server_process_group}" == "1" ]]; then
+      kill -TERM -- "-${server_pid}" >/dev/null 2>&1 || true
+      sleep 0.2
+      kill -KILL -- "-${server_pid}" >/dev/null 2>&1 || true
+    fi
+    kill -TERM "${server_pid}" >/dev/null 2>&1 || true
     wait "${server_pid}" >/dev/null 2>&1 || true
   fi
   if [[ "${status}" -ne 0 && -n "${server_log}" && -f "${server_log}" ]]; then
-    echo "----- darwin-actiond VM log (${server_log}) -----" >&2
+    echo "----- ${server_label} VM log (${server_log}) -----" >&2
     tail -200 "${server_log}" >&2 || true
   fi
   server_pid=""
   server_log=""
+  server_process_group=0
 }
 
 trap 'cleanup_server $?' EXIT
@@ -65,7 +97,7 @@ wait_for_port() {
   start="$(date +%s)"
   while true; do
     if [[ -n "${server_pid}" ]] && ! kill -0 "${server_pid}" >/dev/null 2>&1; then
-      echo "darwin-actiond exited before ${endpoint} became ready" >&2
+      echo "${server_label} exited before ${endpoint} became ready" >&2
       return 1
     fi
     if (echo >"/dev/tcp/${host}/${port}") >/dev/null 2>&1; then
@@ -86,7 +118,7 @@ wait_for_guest_ready() {
   start="$(date +%s)"
   while true; do
     if [[ -n "${server_pid}" ]] && ! kill -0 "${server_pid}" >/dev/null 2>&1; then
-      echo "darwin-actiond exited before the guest became ready" >&2
+      echo "${server_label} exited before the guest became ready" >&2
       return 1
     fi
     if [[ -s "${stats_path}" ]]; then
@@ -106,7 +138,7 @@ prepare_server() {
     cd "${repo_root}"
     bazel run --config=remote \
       --script_path="${server_script_path}" \
-      "${build_mode_flags[@]}" \
+      "${server_build_mode_flags[@]}" \
       ${bazel_build_flags[@]+"${bazel_build_flags[@]}"} \
       "${server_target}"
   ) >&2
@@ -115,7 +147,7 @@ prepare_server() {
 
 run_smoke() {
   local build_log="${output_root}/llvm_tblgen_smoke.log"
-  local measured_server_log="${output_root}/darwin-actiond-vm.measured.log"
+  local measured_server_log="${output_root}/${server_label}-vm.measured.log"
   local remote_grpc_log="${ACTIOND_LLVM_SMOKE_REMOTE_GRPC_LOG:-}"
   local timings="${output_root}/timings.md"
   local server
@@ -124,17 +156,37 @@ run_smoke() {
   mkdir -p "${output_root}"
   "${repo_root}/tools/create_ext4_image.sh" "${cas_image}" "${cas_image_size_mib}"
   server="$(prepare_server)"
-  server_log="${output_root}/darwin-actiond-vm.log"
+  server_log="${output_root}/${server_label}-vm.log"
 
-  "${server}" serve-vm \
-    --listen="${endpoint}" \
-    --root="${output_root}/server" \
-    --cas-image="${cas_image}" \
-    --cas-image-size-mib="${cas_image_size_mib}" \
-    --memory-mib="${memory_mib}" \
-    --cpus="${cpus}" \
-    --actiondfs-stats-path="${output_root}/actiondfs_stats.txt" \
-    >"${server_log}" 2>&1 &
+  local server_cmd=(
+    "${server}" serve-vm
+    --listen="${endpoint}"
+    --root="${output_root}/server"
+    --cas-image="${cas_image}"
+    --cas-image-size-mib="${cas_image_size_mib}"
+    --memory-mib="${memory_mib}"
+    --cpus="${cpus}"
+    --actiondfs-stats-path="${output_root}/actiondfs_stats.txt"
+  )
+  if [[ "${host_os}" == "Linux" && -n "${qemu_path}" ]]; then
+    server_cmd+=(--qemu="${qemu_path}")
+  fi
+  if [[ "${host_os}" == "Linux" && "${ACTIOND_VM_ALLOW_TCG:-0}" == "1" ]]; then
+    server_cmd+=(--allow-tcg)
+  fi
+  if [[ "${host_os}" == "Linux" ]]; then
+    server_cmd+=(--qemu-cache="${ACTIOND_VM_QEMU_CACHE:-none}")
+    if [[ -n "${ACTIOND_VM_QEMU_AIO:-}" ]]; then
+      server_cmd+=(--qemu-aio="${ACTIOND_VM_QEMU_AIO}")
+    fi
+  fi
+  if [[ "${host_os}" == "Linux" ]] && command -v setsid >/dev/null 2>&1; then
+    setsid "${server_cmd[@]}" >"${server_log}" 2>&1 &
+    server_process_group=1
+  else
+    "${server_cmd[@]}" >"${server_log}" 2>&1 &
+    server_process_group=0
+  fi
   server_pid="$!"
 
   wait_for_port 90
@@ -143,11 +195,14 @@ run_smoke() {
   if ! ACTIOND_LLVM_SMOKE_EXECUTOR="grpc://${endpoint}" \
     ACTIOND_LLVM_SMOKE_CACHE="grpc://${endpoint}" \
     ACTIOND_LLVM_SMOKE_JOBS="${jobs}" \
+    ACTIOND_VM_QEMU_CACHE="${ACTIOND_VM_QEMU_CACHE:-none}" \
+    ACTIOND_VM_QEMU_AIO="${ACTIOND_VM_QEMU_AIO:-}" \
     ACTIOND_LLVM_SMOKE_WORKSPACE="${workspace}" \
     ACTIOND_LLVM_SMOKE_TARGET="${smoke_target}" \
     ACTIOND_LLVM_SMOKE_WARMUP_TARGET="${warmup_target}" \
     ACTIOND_LLVM_SMOKE_TARGET_PLATFORM="${target_platform}" \
     ACTIOND_LLVM_SMOKE_HOST_PLATFORM="${host_platform}" \
+    ACTIOND_LLVM_SMOKE_EXEC_PLATFORM="${exec_platform}" \
     ACTIOND_LLVM_SMOKE_SERVER_LOG="${server_log}" \
     ACTIOND_LLVM_SMOKE_MEASURED_SERVER_LOG="${measured_server_log}" \
     ACTIOND_LLVM_SMOKE_REMOTE_GRPC_LOG="${remote_grpc_log}" \
@@ -161,6 +216,10 @@ run_smoke() {
     return 1
   fi
 
+  # Let the host's once-per-second stats poller capture the tail of the build
+  # before the VM is torn down and the timing artifact is parsed.
+  sleep 1.2
+
   elapsed="$(sed -n 's/.*Elapsed time: \([0-9.]*s\).*/\1/p' "${build_log}" | tail -n 1)"
   if [[ ! -s "${measured_server_log}" ]]; then
     echo "measured VM log slice is empty; source log: ${server_log}" >&2
@@ -169,7 +228,7 @@ run_smoke() {
 
   "${repo_root}/test/parse_timings.py" "${measured_server_log}" \
     --mode "llvm-vm" \
-    --command "e2e/run_llvm_vm_smoke.sh" \
+    --command "ACTIOND_VM_CAS_IMAGE_SIZE_MIB=${cas_image_size_mib} ACTIOND_VM_MEMORY_MIB=${memory_mib} ACTIOND_VM_CPUS=${cpus} ACTIOND_LLVM_SMOKE_JOBS=${jobs} ACTIOND_VM_QEMU_CACHE=${ACTIOND_VM_QEMU_CACHE:-none} ACTIOND_VM_QEMU_AIO=${ACTIOND_VM_QEMU_AIO:-default} ACTIOND_LLVM_SMOKE_OPT_SERVER=${ACTIOND_LLVM_SMOKE_OPT_SERVER:-0} e2e/run_llvm_vm_smoke.sh" \
     --bazel-elapsed "${elapsed:-unknown}" \
     --workload "${smoke_target}, warmup=${warmup_target:-none}, jobs=${jobs_label}" \
     --output "${timings}"
@@ -256,8 +315,8 @@ EOF
   echo "mac-host timing summary: ${timings}" >&2
 }
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "LLVM VM smoke must run on macOS with Virtualization.framework" >&2
+if [[ "${host_os}" != "Darwin" && "${host_os}" != "Linux" ]]; then
+  echo "LLVM VM smoke must run on macOS or Linux" >&2
   exit 1
 fi
 
