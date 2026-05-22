@@ -15,6 +15,21 @@ platform(
     visibility = ["//visibility:public"],
 )
 
+platform(
+    name = "actiond_linux_x86_64_musl_exec",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "@llvm//constraints/libc:musl",
+    ],
+    exec_properties = {
+        "Arch": "x86_64",
+        "OSFamily": "Linux",
+        "container-image": "docker://ubuntu:22.04",
+    },
+    visibility = ["//visibility:public"],
+)
+
 exec_warmup(
     name = "llvm_exec_warmup",
     deps = [

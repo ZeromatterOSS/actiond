@@ -7,3 +7,11 @@ platform_transition_binary(
     target_platform = "@llvm//platforms:linux_arm64_musl",
     visibility = ["//visibility:public"],
 )
+
+platform_transition_binary(
+    name = "mkfs_ext4_linux_x86_64",
+    basename = "mkfs.ext4",
+    binary = "@e2fsprogs//:mkfs_ext4.stripped",
+    target_platform = "@llvm//platforms:linux_x86_64_musl",
+    visibility = ["//visibility:public"],
+)

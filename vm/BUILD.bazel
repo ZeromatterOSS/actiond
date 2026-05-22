@@ -1,16 +1,32 @@
 load("@linux.bzl//:linux.bzl", "linux")
 
 genrule(
-    name = "initramfs",
-    srcs = [
-        "//cmd/linux_actiond_guest:linux-actiond-guest-aarch64",
-    ],
+    name = "initramfs_aarch64",
+    srcs = ["//cmd/linux_actiond_guest:linux-actiond-guest-aarch64"],
     outs = ["initramfs.cpio.zst"],
     cmd = "$(execpath //tools:initramfs_newc) $@ $(location //cmd/linux_actiond_guest:linux-actiond-guest-aarch64) --file=$(execpath //third_party/e2fsprogs:mkfs_ext4_linux_aarch64)=/sbin/mkfs.ext4",
     tools = [
         "//third_party/e2fsprogs:mkfs_ext4_linux_aarch64",
         "//tools:initramfs_newc",
     ],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "initramfs_x86_64",
+    srcs = ["//cmd/linux_actiond_guest:linux-actiond-guest-x86_64"],
+    outs = ["initramfs-x86_64.cpio.zst"],
+    cmd = "$(execpath //tools:initramfs_newc) $@ $(location //cmd/linux_actiond_guest:linux-actiond-guest-x86_64) --file=$(execpath //third_party/e2fsprogs:mkfs_ext4_linux_x86_64)=/sbin/mkfs.ext4",
+    tools = [
+        "//third_party/e2fsprogs:mkfs_ext4_linux_x86_64",
+        "//tools:initramfs_newc",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "initramfs",
+    actual = ":initramfs_aarch64",
     visibility = ["//visibility:public"],
 )
 
@@ -27,6 +43,24 @@ linux(
     extra_srcs = ["//kernel/actiondfs:srcs"],
     image_format = "Image",
     source_repo = "@linux_6_18_2",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+linux(
+    name = "linux_kernel_x86_64",
+    compact_repos = {
+        "x86_64": "@actiond_vm_x86_64_compact",
+    },
+    config = "@actiond_vm_x86_64_kconfig//:kconfig",
+    config_mode = "allnoconfig",
+    extra_kconfigs = {
+        "//kernel/actiondfs:Kconfig": "fs/actiondfs",
+    },
+    extra_srcs = ["//kernel/actiondfs:srcs"],
+    image_format = "bzImage",
+    source_repo = "@linux_6_18_2",
+    tags = ["manual"],
     visibility = ["//visibility:public"],
 )
 
@@ -35,6 +69,16 @@ genrule(
     srcs = [":linux_kernel"],
     outs = ["Image.zst"],
     cmd = "$(execpath //tools:zstd_file) $(location :linux_kernel) $@",
+    target_compatible_with = ["@platforms//cpu:aarch64"],
+    tools = ["//tools:zstd_file"],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "linux_kernel_x86_64_zst",
+    srcs = [":linux_kernel_x86_64"],
+    outs = ["bzImage.zst"],
+    cmd = "$(execpath //tools:zstd_file) $(location :linux_kernel_x86_64) $@",
     tools = ["//tools:zstd_file"],
     visibility = ["//visibility:public"],
 )
@@ -42,9 +86,20 @@ genrule(
 filegroup(
     name = "vm_bundle",
     srcs = [
-        ":initramfs",
+        ":initramfs_aarch64",
         ":linux_kernel_zst",
         "//runtimes:runtimes_squashfs",
+    ],
+    target_compatible_with = ["@platforms//cpu:aarch64"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "vm_bundle_x86_64",
+    srcs = [
+        ":initramfs_x86_64",
+        ":linux_kernel_x86_64_zst",
+        "//runtimes:runtimes_squashfs_x86_64",
     ],
     visibility = ["//visibility:public"],
 )

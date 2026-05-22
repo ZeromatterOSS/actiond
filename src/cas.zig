@@ -737,7 +737,7 @@ fn beginAnonymousLinux(store: Store) !?std.Io.File {
             },
             @intCast(cas_blob_mode),
         );
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => return .{ .handle = @intCast(rc), .flags = .{ .nonblocking = false } },
             .INTR => continue,
             .INVAL, .ISDIR, .NOENT, .OPNOTSUPP => return null,
@@ -786,7 +786,7 @@ fn linkAnonymousLinux(
 
     while (true) {
         const rc = std.os.linux.linkat(old_fd, old_path, dest_dir_fd, dest_path_z, flags);
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => return,
             .INTR => continue,
             .ACCES => return error.AccessDenied,
@@ -959,7 +959,7 @@ fn openFileLinuxRetry(dir: std.Io.Dir, path: []const u8) !std.Io.File {
             .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
             0,
         );
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => return .{ .handle = @intCast(rc), .flags = .{ .nonblocking = false } },
             .INTR => continue,
             .STALE => {
@@ -989,7 +989,11 @@ fn sleepStaleRetry() void {
         .sec = 0,
         .nsec = stale_retry_sleep_ns,
     };
-    while (std.posix.errno(std.os.linux.nanosleep(&request, &request)) == .INTR) {}
+    while (linuxErrno(std.os.linux.nanosleep(&request, &request)) == .INTR) {}
+}
+
+fn linuxErrno(rc: usize) std.os.linux.E {
+    return std.os.linux.errno(rc);
 }
 
 fn createFileLinuxRetry(
@@ -1010,7 +1014,7 @@ fn createFileLinuxRetry(
             .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
             mode,
         );
-        switch (std.posix.errno(rc)) {
+        switch (linuxErrno(rc)) {
             .SUCCESS => return .{ .handle = @intCast(rc), .flags = .{ .nonblocking = false } },
             .INTR => continue,
             .STALE => {

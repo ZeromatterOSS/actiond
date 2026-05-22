@@ -1,12 +1,13 @@
 # actiond
 
-`actiond` is a local Remote Execution API worker and cache for Bazel. On macOS
-it starts a small Linux VM and runs Bazel actions inside that VM, so a Mac can
-act like a local Linux remote-execution worker.
+`actiond` is a local Remote Execution API worker and cache for Bazel. It can run
+actions directly on Linux, or inside a small Linux VM on macOS and Linux x86_64
+hosts, so a local machine can act like a Linux remote-execution worker.
 
-The main user-facing binary is `darwin-actiond`. It includes the VM kernel,
-initramfs, and Linux runtime image, so you do not need to build this repository
-from source to use it.
+The main macOS user-facing binary is `darwin-actiond`. It includes the VM
+kernel, initramfs, and Linux runtime image, so you do not need to build this
+repository from source to use it. Linux hosts use `linux-actiond` for direct
+execution or `linux-actiond serve-vm` for the QEMU/KVM actiondfs VM path.
 
 ## Why Use It?
 
@@ -40,10 +41,22 @@ You can also download the binary from the
 
 ## Start The Worker
 
+On macOS:
+
 ```bash
 ./darwin-actiond_macos_arm64 serve-vm \
   --listen=127.0.0.1:8980 \
   --root="$HOME/Library/Caches/actiond/vm"
+```
+
+On Linux x86_64 with KVM:
+
+```bash
+bazel build //cmd/linux_actiond:linux-actiond-standalone_pkg
+bazel-bin/cmd/linux_actiond/linux-actiond-standalone serve-vm \
+  --listen=127.0.0.1:8980 \
+  --root=/tmp/actiond-vm \
+  --cas-image=/tmp/actiond-vm/cas.ext4
 ```
 
 `--root` stores the VM state, including the guest-owned CAS and ActionCache.
@@ -95,6 +108,8 @@ Most users should use releases. Source builds are mainly for development:
 
 ```bash
 bazel build --config=remote -c opt //cmd/darwin-actiond
+bazel build --config=remote -c opt //cmd/linux_actiond:linux-actiond-standalone_pkg \
+  --platforms=//platforms:linux_x86_64
 ```
 
 Normal contributor checks:

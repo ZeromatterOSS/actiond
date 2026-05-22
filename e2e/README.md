@@ -8,18 +8,17 @@ stress workspace.
 
 `llvm_tblgen_smoke.sh` builds `@llvm-project//llvm:llvm-tblgen` from this
 repo's `@llvm` module dependency against an already-running actiond VM worker.
-It uses `@llvm//platforms:linux_arm64_musl` for both the target and host
-platforms, so generated exec tools are Linux arm64 musl binaries that can run
-inside the VM. The smoke builds with `-c opt --strip=always
---stripopt=--strip-all`:
+The platform is supplied by the runner: macOS VM runs use Linux arm64 musl, and
+Linux QEMU VM runs use Linux x86_64 musl. The smoke builds with `-c opt
+--strip=always --stripopt=--strip-all`:
 
 ```bash
 e2e/llvm_tblgen_smoke.sh
 ```
 
-Start `darwin-actiond serve-vm` on `127.0.0.1:8998` before running it. The
-script runs `bazel clean --expunge` by default so a fresh worker CAS gets a full
-upload.
+Start `darwin-actiond serve-vm` or `linux-actiond serve-vm` on
+`127.0.0.1:8998` before running it. The script runs `bazel clean --expunge` by
+default so a fresh worker CAS gets a full upload.
 
 VM mode expects a writable ext4 CAS image attached as virtio-blk. `serve-vm`
 creates a sparse image when the configured path is missing, and the guest
@@ -30,10 +29,11 @@ Existing images are never reformatted automatically.
 
 ## LLVM VM Smoke Runner
 
-`run_llvm_vm_smoke.sh` starts a fresh VM worker, runs the LLVM tblgen smoke,
-then runs the same target locally on the macOS host with the same musl target
-platform. It writes parsed VM timing summaries and a mac-host elapsed-time
-summary under an output directory:
+`run_llvm_vm_smoke.sh` starts a fresh VM worker and runs the LLVM tblgen smoke.
+On Linux x86_64 it starts `linux-actiond serve-vm` with QEMU/KVM and skips the
+mac-host baseline by default. On macOS it starts `darwin-actiond serve-vm` and
+also runs the same target locally on the macOS host with the same musl target
+platform. It writes parsed timing summaries under an output directory:
 
 ```bash
 e2e/run_llvm_vm_smoke.sh
@@ -67,11 +67,10 @@ stats snapshots together by default. Set
 `ACTIOND_LLVM_SMOKE_EXECUTOR_TIMING_LOGS=0` to build the no-log server path and
 skip the parsed VM timing markdown and stats snapshots.
 
-Both VM and mac-host runs set the target platform to
-`@llvm//platforms:linux_arm64_musl`. The VM run also sets the host platform to
-Linux musl because host tools execute inside the VM. The mac-host run leaves the
-host platform as macOS, otherwise Bazel would build Linux host tools and then
-try to execute them locally on Darwin. Some Bazel output paths still include
+VM runs set both target and host platforms to the guest Linux musl platform
+because host tools execute inside the VM. The mac-host run leaves the host
+platform as macOS, otherwise Bazel would build Linux host tools and then try to
+execute them locally on Darwin. Some Bazel output paths still include
 `darwin_arm64-opt`; check the compile command target triple, not just the output
 directory name.
 
