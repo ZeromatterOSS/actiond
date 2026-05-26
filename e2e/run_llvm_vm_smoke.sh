@@ -6,8 +6,8 @@ host_os="$(uname -s)"
 if [[ "${host_os}" == "Linux" ]]; then
   default_target_platform="@llvm//platforms:linux_x86_64_musl"
   default_exec_platform="//e2e:actiond_linux_x86_64_musl_exec"
-  default_server_target="//cmd/linux_actiond:linux-actiond-standalone_pkg"
-  default_server_script_path="/tmp/linux-actiond-standalone"
+  default_server_target="//cmd/linux_actiond:linux-actiond-vm-standalone_pkg"
+  default_server_script_path="/tmp/linux-actiond-vm-standalone"
   default_run_mac_host=0
   server_label="linux-actiond"
 else
@@ -54,12 +54,11 @@ build_mode_flags=(
   --stripopt=--strip-all
 )
 server_build_mode_flags=("${build_mode_flags[@]}")
-if [[ "${host_os}" == "Linux" && "${ACTIOND_LLVM_SMOKE_OPT_SERVER:-0}" != "1" ]]; then
-  # linux.bzl's x86_64 bzImage currently boots under fastbuild but not under
-  # Bazel -c opt. Keep the measured LLVM workload opt-built while using a
-  # bootable Linux VM bundle for the QEMU host.
-  server_build_mode_flags=()
-fi
+benchmark_zig_bazel_flags=(
+  --@rules_zig//zig/settings:mode=release_fast
+  --@rules_zig//zig/settings:zigopt=-mcpu=native
+)
+prebuilt_server_script_path="${ACTIOND_LLVM_SMOKE_PREBUILT_SERVER_SCRIPT:-}"
 bazel_build_flags=()
 if [[ -n "${ACTIOND_BAZEL_BUILD_FLAGS:-}" ]]; then
   read -r -a bazel_build_flags <<<"${ACTIOND_BAZEL_BUILD_FLAGS}"
@@ -133,6 +132,39 @@ wait_for_guest_ready() {
 }
 
 prepare_server() {
+  if [[ -n "${prebuilt_server_script_path}" ]]; then
+    if [[ ! -x "${prebuilt_server_script_path}" ]]; then
+      echo "prebuilt standalone script is not executable: ${prebuilt_server_script_path}" >&2
+      return 1
+    fi
+    printf '%s\n' "${prebuilt_server_script_path}"
+    return 0
+  fi
+
+  if [[ "${host_os}" == "Linux" ]]; then
+    local copied_server="${output_root}/linux-actiond-vm-standalone"
+    (
+      cd "${repo_root}"
+      bazel build --config=remote \
+        "${server_build_mode_flags[@]}" \
+        ${bazel_build_flags[@]+"${bazel_build_flags[@]}"} \
+        "${benchmark_zig_bazel_flags[@]}" \
+        "${server_target}" >&2
+    ) >&2
+    local built_server
+    built_server="$(
+      cd "${repo_root}"
+      bazel cquery --config=remote -c opt \
+        ${bazel_build_flags[@]+"${bazel_build_flags[@]}"} \
+        "${benchmark_zig_bazel_flags[@]}" \
+        --output=files "${server_target}" | tail -n 1
+    )"
+    cp "${repo_root}/${built_server}" "${copied_server}"
+    chmod +x "${copied_server}"
+    printf '%s\n' "${copied_server}"
+    return 0
+  fi
+
   mkdir -p "$(dirname "${server_script_path}")"
   (
     cd "${repo_root}"
@@ -140,6 +172,7 @@ prepare_server() {
       --script_path="${server_script_path}" \
       "${server_build_mode_flags[@]}" \
       ${bazel_build_flags[@]+"${bazel_build_flags[@]}"} \
+      "${benchmark_zig_bazel_flags[@]}" \
       "${server_target}"
   ) >&2
   printf '%s\n' "${server_script_path}"
@@ -171,6 +204,9 @@ run_smoke() {
   if [[ "${host_os}" == "Linux" && -n "${qemu_path}" ]]; then
     server_cmd+=(--qemu="${qemu_path}")
   fi
+  if [[ "${host_os}" == "Linux" ]]; then
+    server_cmd+=(--qemu-machine="${ACTIOND_VM_QEMU_MACHINE:-q35}")
+  fi
   if [[ "${host_os}" == "Linux" && "${ACTIOND_VM_ALLOW_TCG:-0}" == "1" ]]; then
     server_cmd+=(--allow-tcg)
   fi
@@ -178,6 +214,9 @@ run_smoke() {
     server_cmd+=(--qemu-cache="${ACTIOND_VM_QEMU_CACHE:-none}")
     if [[ -n "${ACTIOND_VM_QEMU_AIO:-}" ]]; then
       server_cmd+=(--qemu-aio="${ACTIOND_VM_QEMU_AIO}")
+    fi
+    if [[ -n "${ACTIOND_VM_QEMU_BLOCK_QUEUES:-}" ]]; then
+      server_cmd+=(--qemu-block-queues="${ACTIOND_VM_QEMU_BLOCK_QUEUES}")
     fi
   fi
   if [[ "${host_os}" == "Linux" ]] && command -v setsid >/dev/null 2>&1; then
@@ -197,6 +236,7 @@ run_smoke() {
     ACTIOND_LLVM_SMOKE_JOBS="${jobs}" \
     ACTIOND_VM_QEMU_CACHE="${ACTIOND_VM_QEMU_CACHE:-none}" \
     ACTIOND_VM_QEMU_AIO="${ACTIOND_VM_QEMU_AIO:-}" \
+    ACTIOND_VM_QEMU_BLOCK_QUEUES="${ACTIOND_VM_QEMU_BLOCK_QUEUES:-}" \
     ACTIOND_LLVM_SMOKE_WORKSPACE="${workspace}" \
     ACTIOND_LLVM_SMOKE_TARGET="${smoke_target}" \
     ACTIOND_LLVM_SMOKE_WARMUP_TARGET="${warmup_target}" \
@@ -228,7 +268,7 @@ run_smoke() {
 
   "${repo_root}/test/parse_timings.py" "${measured_server_log}" \
     --mode "llvm-vm" \
-    --command "ACTIOND_VM_CAS_IMAGE_SIZE_MIB=${cas_image_size_mib} ACTIOND_VM_MEMORY_MIB=${memory_mib} ACTIOND_VM_CPUS=${cpus} ACTIOND_LLVM_SMOKE_JOBS=${jobs} ACTIOND_VM_QEMU_CACHE=${ACTIOND_VM_QEMU_CACHE:-none} ACTIOND_VM_QEMU_AIO=${ACTIOND_VM_QEMU_AIO:-default} ACTIOND_LLVM_SMOKE_OPT_SERVER=${ACTIOND_LLVM_SMOKE_OPT_SERVER:-0} e2e/run_llvm_vm_smoke.sh" \
+    --command "ACTIOND_VM_CAS_IMAGE_SIZE_MIB=${cas_image_size_mib} ACTIOND_VM_MEMORY_MIB=${memory_mib} ACTIOND_VM_CPUS=${cpus} ACTIOND_LLVM_SMOKE_JOBS=${jobs} ACTIOND_VM_QEMU_MACHINE=${ACTIOND_VM_QEMU_MACHINE:-q35} ACTIOND_VM_QEMU_CACHE=${ACTIOND_VM_QEMU_CACHE:-none} ACTIOND_VM_QEMU_AIO=${ACTIOND_VM_QEMU_AIO:-io_uring} ACTIOND_VM_QEMU_BLOCK_QUEUES=${ACTIOND_VM_QEMU_BLOCK_QUEUES:-} e2e/run_llvm_vm_smoke.sh" \
     --bazel-elapsed "${elapsed:-unknown}" \
     --workload "${smoke_target}, warmup=${warmup_target:-none}, jobs=${jobs_label}" \
     --output "${timings}"

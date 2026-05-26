@@ -1,10 +1,12 @@
 load("@rules_zig//zig:defs.bzl", "zig_binary")
+load("//:zig_opts.bzl", "actiond_zigopts")
 
 zig_binary(
     name = "linux-actiond",
     main = "main.zig",
     strip_debug_symbols = True,
     visibility = ["//visibility:public"],
+    zigopts = actiond_zigopts(),
     deps = ["//src:actiond"],
 )
 
@@ -12,11 +14,31 @@ genrule(
     name = "linux-actiond-standalone_pkg",
     srcs = [
         ":linux-actiond",
+        "//runtimes:runtimes_squashfs",
+    ],
+    outs = ["linux-actiond-standalone"],
+    cmd = """
+set -euo pipefail
+cp "$(location :linux-actiond)" "$@"
+chmod +w "$@"
+"$(execpath @llvm//tools:llvm-objcopy)" --add-section .actiond.runtimes="$(location //runtimes:runtimes_squashfs)" "$@"
+chmod +x "$@"
+""",
+    executable = True,
+    target_compatible_with = ["@platforms//os:linux"],
+    tools = ["@llvm//tools:llvm-objcopy"],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "linux-actiond-vm-standalone_pkg",
+    srcs = [
+        ":linux-actiond",
         "//runtimes:runtimes_squashfs_x86_64",
         "//vm:initramfs_x86_64",
         "//vm:linux_kernel_x86_64_zst",
     ],
-    outs = ["linux-actiond-standalone"],
+    outs = ["linux-actiond-vm-standalone"],
     cmd = """
 set -euo pipefail
 cp "$(location :linux-actiond)" "$@"

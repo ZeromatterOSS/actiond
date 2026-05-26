@@ -38,13 +38,14 @@ bazel build //cmd/linux_actiond:linux-actiond-standalone \
   --platforms=//platforms:linux_aarch64
 bazel build //cmd/linux_actiond:linux-actiond-standalone \
   --platforms=//platforms:linux_x86_64
+bazel build //cmd/linux_actiond:linux-actiond-vm-standalone_pkg
 bazel build //vm:linux_kernel_zst //vm:initramfs //runtimes:runtimes_squashfs
 bazel build //vm:linux_kernel_x86_64_zst //vm:initramfs_x86_64 //runtimes:runtimes_squashfs_x86_64
 ```
 
-The direct Linux standalone target follows Bazel's target platform. The Linux
-QEMU VM standalone package is x86_64-only and embeds the x86_64 runtime,
-kernel, and initramfs artifacts.
+The direct Linux standalone target and package follow Bazel's target platform.
+The Linux QEMU VM standalone package is x86_64-only and embeds the x86_64
+runtime, kernel, and initramfs artifacts.
 
 The VM kernel is built by `linux.bzl` from the Linux archive declared in
 `MODULE.bazel`. The repository applies a small x86_64 relocation-check patch to
@@ -62,6 +63,7 @@ bazel build -c opt //cmd/linux_actiond:linux-actiond-standalone_pkg \
   --platforms=//platforms:linux_aarch64
 bazel build -c opt //cmd/linux_actiond:linux-actiond-standalone_pkg \
   --platforms=//platforms:linux_x86_64
+bazel build -c opt //cmd/linux_actiond:linux-actiond-vm-standalone_pkg
 ```
 
 ## Running
@@ -115,8 +117,8 @@ namespaces, and cgroups. The Docker e2e harness runs privileged for this reason.
 On Linux x86_64 with KVM:
 
 ```bash
-bazel build //cmd/linux_actiond:linux-actiond-standalone_pkg
-bazel-bin/cmd/linux_actiond/linux-actiond-standalone serve-vm \
+bazel build //cmd/linux_actiond:linux-actiond-vm-standalone_pkg
+bazel-bin/cmd/linux_actiond/linux-actiond-vm-standalone serve-vm \
   --listen=127.0.0.1:8980 \
   --root=/tmp/actiond-vm \
   --cas-image=/tmp/actiond-vm/cas.ext4
@@ -159,9 +161,11 @@ Full LLVM smoke comparison, including VM startup and a mac-host baseline:
 e2e/run_llvm_vm_smoke.sh
 ```
 
-The VM smoke uses `--platforms=@llvm//platforms:linux_arm64_musl` and
-`--host_platform=@llvm//platforms:linux_arm64_musl` so generated exec tools run
-inside the Linux VM and do not depend on glibc inside actiond chroots.
+The VM smoke chooses the guest platform for the host OS: macOS VM runs use
+Linux arm64 musl, and Linux QEMU VM runs use Linux x86_64 musl. The target and
+host platforms are both set to the guest Linux musl platform so generated exec
+tools run inside the Linux worker and do not depend on glibc inside actiond
+chroots.
 
 The fresh-VM runner defaults to `--jobs=8` for stable comparisons; override it
 with `ACTIOND_LLVM_SMOKE_JOBS`, or set that variable to an empty value to let

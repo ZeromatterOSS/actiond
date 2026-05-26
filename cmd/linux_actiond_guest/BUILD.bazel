@@ -1,11 +1,13 @@
 load("@bazel_lib//lib:transitions.bzl", "platform_transition_binary")
 load("@rules_zig//zig:defs.bzl", "zig_binary")
+load("//:zig_opts.bzl", "actiond_zigopts")
 
 zig_binary(
     name = "linux-actiond-guest",
     main = "main.zig",
     strip_debug_symbols = True,
     visibility = ["//visibility:public"],
+    zigopts = actiond_zigopts(),
     deps = ["//src:actiond"],
 )
 

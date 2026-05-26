@@ -1,6 +1,7 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:objc_library.bzl", "objc_library")
 load("@rules_zig//zig:defs.bzl", "zig_binary")
+load("//:zig_opts.bzl", "actiond_zigopts")
 
 objc_library(
     name = "vz_bridge",
@@ -21,6 +22,7 @@ zig_binary(
     main = "main.zig",
     strip_debug_symbols = True,
     target_compatible_with = ["@platforms//os:macos"],
+    zigopts = actiond_zigopts(),
     deps = [
         ":vz_bridge",
         "//src:actiond",
@@ -53,6 +55,7 @@ zig_binary(
     main = "main.zig",
     strip_debug_symbols = True,
     target_compatible_with = ["@platforms//os:macos"],
+    zigopts = actiond_zigopts(),
     deps = [
         ":darwin-standalone-payload-sections",
         ":vz_bridge",

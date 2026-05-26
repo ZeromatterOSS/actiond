@@ -113,7 +113,7 @@ fn expectNetworkBlocked() !void {
         linux.SOCK.DGRAM | linux.SOCK.CLOEXEC,
         linux.IPPROTO.UDP,
     );
-    switch (std.posix.errno(socket_rc)) {
+    switch (linux.errno(socket_rc)) {
         .SUCCESS => {},
         .AFNOSUPPORT, .PROTONOSUPPORT => return,
         else => |err| {
@@ -133,7 +133,7 @@ fn expectNetworkBlocked() !void {
         @as(*const linux.sockaddr, @ptrCast(&addr)),
         @sizeOf(linux.sockaddr.in),
     );
-    switch (std.posix.errno(connect_rc)) {
+    switch (linux.errno(connect_rc)) {
         .NETUNREACH, .HOSTUNREACH, .NETDOWN, .ADDRNOTAVAIL, .ACCES, .PERM => return,
         .SUCCESS => {
             var local_addr: linux.sockaddr.in = std.mem.zeroes(linux.sockaddr.in);
@@ -260,7 +260,7 @@ fn expectLoopbackTcp() !void {
         .port = bound_addr.port,
         .addr = std.mem.nativeToBig(u32, 0x7f000001),
     };
-    switch (std.posix.errno(linux.connect(
+    switch (linux.errno(linux.connect(
         client_fd,
         @as(*const linux.sockaddr, @ptrCast(&connect_addr)),
         @sizeOf(linux.sockaddr.in),
@@ -273,7 +273,7 @@ fn expectLoopbackTcp() !void {
     }
 
     const accepted_rc = linux.accept(listener_fd, null, null);
-    switch (std.posix.errno(accepted_rc)) {
+    switch (linux.errno(accepted_rc)) {
         .SUCCESS => _ = linux.close(@intCast(accepted_rc)),
         else => |err| {
             std.debug.print("loopback check could not accept local connection: {s}\n", .{@tagName(err)});
@@ -285,7 +285,7 @@ fn expectLoopbackTcp() !void {
 fn tcpSocket() !i32 {
     const linux = std.os.linux;
     const socket_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-    switch (std.posix.errno(socket_rc)) {
+    switch (linux.errno(socket_rc)) {
         .SUCCESS => return @intCast(socket_rc),
         else => |err| {
             std.debug.print("network check could not create TCP socket: {s}\n", .{@tagName(err)});

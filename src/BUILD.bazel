@@ -1,4 +1,5 @@
 load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
+load("//:zig_opts.bzl", "actiond_zigopts")
 
 zig_library(
     name = "actiond",
@@ -88,4 +89,5 @@ zig_test(
         "vsock.zig",
     ],
     deps = ["@zstd"],
+    zigopts = actiond_zigopts(),
 )

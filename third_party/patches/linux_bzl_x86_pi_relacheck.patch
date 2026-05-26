@@ -1,17 +1,107 @@
+diff --git a/internal/architectures.bzl b/internal/architectures.bzl
+index d20519d..51d00d9 100644
+--- a/internal/architectures.bzl
++++ b/internal/architectures.bzl
+@@ -9,7 +9,7 @@ def linux_architectures():
+             arch = "x86",
+             compact_vars = {
+                 "ARCH_CORE": "",
+-                "ARCH_DRIVERS": "arch/x86/pci/ arch/x86/power/ arch/x86/video/",
++                "ARCH_DRIVERS": "arch/x86/pci/ arch/x86/power/",
+                 "ARCH_LIB": "lib/ arch/x86/lib/",
+                 "BITS": "64",
+                 "PROFILING": "",
+diff --git a/internal/linux.bzl b/internal/linux.bzl
+index 385e918..346783f 100644
+--- a/internal/linux.bzl
++++ b/internal/linux.bzl
+@@ -56,6 +56,7 @@ def linux(
+     native.alias(
+         name = name,
+         actual = select(actuals),
++        tags = tags,
+         visibility = visibility,
+     )
+
+@@ -112,6 +113,7 @@ def _define_arch_kernel(
+             arch = arch.config_name,
+             requested = image_format,
+             target_compatible_with = [arch.platform],
++            tags = tags,
+         )
+         return ":" + unsupported_image_format_target
+
 diff --git a/internal/linux_objects.bzl b/internal/linux_objects.bzl
-index 0000000..0000000 100644
+index 6dc4634..444c758 100644
 --- a/internal/linux_objects.bzl
 +++ b/internal/linux_objects.bzl
-@@ -570,1 +570,3 @@ def _linux_object_needs_relacheck(object):
--    return object.endswith(".pi.o")
+@@ -204,6 +204,8 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
+             "-nostdlibinc",
+             "-Werror=incomplete-umbrella",
+             "-Wall",
++            "-fdata-sections",
++            "-ffunction-sections",
+             "-Wno-builtin-macro-redefined",
+             "-Wno-free-nonheap-object",
+             "-Wno-module-import-in-extern-c",
+@@ -235,6 +237,10 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
+         out.append("-nostdinc")
+     if "-fintegrated-as" not in out:
+         out.append("-fintegrated-as")
++    if "-fno-data-sections" not in out:
++        out.append("-fno-data-sections")
++    if "-fno-function-sections" not in out:
++        out.append("-fno-function-sections")
+     return out
+
+ def _linux_kbuild_target_triple(ctx):
+@@ -567,6 +573,8 @@ def _linux_objcopy_flags_for_object(object, arch = ""):
+     return []
+
+ def _linux_object_needs_relacheck(object):
 +    if object.startswith("arch/x86/boot/startup/"):
 +        return False
-+    return object.endswith(".pi.o")
+     return object.endswith(".pi.o")
+
+ def _linux_perlasm_kind(object):
+@@ -3730,7 +3738,7 @@ def _linux_real_compact_image_impl(ctx, object_infos):
+     out = ctx.actions.declare_file(ctx.label.name + ".vmlinux.a")
+     object_outputs = [info.output for info in object_infos]
+     args = ctx.actions.args()
+-    args.add("cDPrST")
++    args.add("cDPrS")
+     args.add(out)
+     args.add_all(object_outputs)
+     ctx.actions.run(
+@@ -4618,7 +4626,7 @@ def _linux_x86_archive(ctx, archiver, cc_toolchain, out_relpath, objects):
+         return None
+     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
+     args = ctx.actions.args()
+-    args.add("cDPrST")
++    args.add("cDPrS")
+     args.add(out)
+     args.add_all(objects)
+     ctx.actions.run(
+@@ -4662,10 +4670,12 @@ def _linux_x86_compressed_vmlinux(ctx, compiler, linker, archiver, cc_toolchain,
+         ("arch/x86/boot/compressed/idt_64.c", "arch/x86/boot/compressed/idt_64.o", [], []),
+         ("arch/x86/boot/compressed/idt_handlers_64.S", "arch/x86/boot/compressed/idt_handlers_64.o", [], []),
+         ("arch/x86/boot/compressed/pgtable_64.c", "arch/x86/boot/compressed/pgtable_64.o", [], []),
+-        ("arch/x86/boot/compressed/early_serial_console.c", "arch/x86/boot/compressed/early_serial_console.o", [], []),
+-        ("arch/x86/boot/compressed/kaslr.c", "arch/x86/boot/compressed/kaslr.o", [], []),
+         ("arch/x86/boot/compressed/acpi.c", "arch/x86/boot/compressed/acpi.o", [], []),
+     ]
++    if _linux_x86_config_enabled(config, "CONFIG_EARLY_PRINTK"):
++        source_specs.append(("arch/x86/boot/compressed/early_serial_console.c", "arch/x86/boot/compressed/early_serial_console.o", [], []))
++    if _linux_x86_config_enabled(config, "CONFIG_RANDOMIZE_BASE"):
++        source_specs.append(("arch/x86/boot/compressed/kaslr.c", "arch/x86/boot/compressed/kaslr.o", [], []))
+     if _linux_x86_config_enabled(config, "CONFIG_AMD_MEM_ENCRYPT"):
+         source_specs.extend([
+             ("arch/x86/boot/compressed/mem_encrypt.S", "arch/x86/boot/compressed/mem_encrypt.o", [], []),
 diff --git a/internal/x86_host_tools.bzl b/internal/x86_host_tools.bzl
-index 0000000..0000000 100644
+index 5df528e..9394c66 100644
 --- a/internal/x86_host_tools.bzl
 +++ b/internal/x86_host_tools.bzl
-@@ -303,6 +303,51 @@ def linux_x86_host_tools(
+@@ -302,6 +302,51 @@ def linux_x86_host_tools(
              "#define ELF_ST_TYPE(o) ELF32_ST_TYPE(o)",
              "#define ELF_ST_BIND(o) ELF32_ST_BIND(o)",
              "#define ELF_ST_VISIBILITY(o) ELF32_ST_VISIBILITY(o)",
@@ -63,7 +153,7 @@ index 0000000..0000000 100644
              "EOF",
              "cat $(location %s) >> $(location %s_x86_relocs_32.c)" % (source_label(source_repo, "arch/x86/tools/relocs.c"), target_prefix),
              "cat > $(location %s_x86_relocs_64.c) <<'EOF'" % target_prefix,
-@@ -321,6 +369,45 @@ def linux_x86_host_tools(
+@@ -317,6 +362,45 @@ def linux_x86_host_tools(
              "#define ELF_ST_TYPE(o) ELF64_ST_TYPE(o)",
              "#define ELF_ST_BIND(o) ELF64_ST_BIND(o)",
              "#define ELF_ST_VISIBILITY(o) ELF64_ST_VISIBILITY(o)",
@@ -109,73 +199,3 @@ index 0000000..0000000 100644
              "EOF",
              "cat $(location %s) >> $(location %s_x86_relocs_64.c)" % (source_label(source_repo, "arch/x86/tools/relocs.c"), target_prefix),
          ]),
-diff --git a/internal/linux_objects.bzl b/internal/linux_objects.bzl
-index 0000000..0000000 100644
---- a/internal/linux_objects.bzl
-+++ b/internal/linux_objects.bzl
-@@ -4621,7 +4621,7 @@ def _linux_x86_archive(ctx, archiver, cc_toolchain, out_relpath, objects):
-     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
-     args = ctx.actions.args()
--    args.add("cDPrST")
-+    args.add("cDPrS")
-     args.add(out)
-     args.add_all(objects)
-     ctx.actions.run(
-@@ -4665,9 +4665,11 @@ def _linux_x86_compressed_image(ctx, image):
-         ("arch/x86/boot/compressed/idt_handlers_64.S", "arch/x86/boot/compressed/idt_handlers_64.o", [], []),
-         ("arch/x86/boot/compressed/pgtable_64.c", "arch/x86/boot/compressed/pgtable_64.o", [], []),
--        ("arch/x86/boot/compressed/early_serial_console.c", "arch/x86/boot/compressed/early_serial_console.o", [], []),
--        ("arch/x86/boot/compressed/kaslr.c", "arch/x86/boot/compressed/kaslr.o", [], []),
-         ("arch/x86/boot/compressed/acpi.c", "arch/x86/boot/compressed/acpi.o", [], []),
-     ]
-+    if _linux_x86_config_enabled(config, "CONFIG_EARLY_PRINTK"):
-+        source_specs.append(("arch/x86/boot/compressed/early_serial_console.c", "arch/x86/boot/compressed/early_serial_console.o", [], []))
-+    if _linux_x86_config_enabled(config, "CONFIG_RANDOMIZE_BASE"):
-+        source_specs.append(("arch/x86/boot/compressed/kaslr.c", "arch/x86/boot/compressed/kaslr.o", [], []))
-     if _linux_x86_config_enabled(config, "CONFIG_AMD_MEM_ENCRYPT"):
-         source_specs.extend([
-             ("arch/x86/boot/compressed/mem_encrypt.S", "arch/x86/boot/compressed/mem_encrypt.o", [], []),
-diff --git a/internal/architectures.bzl b/internal/architectures.bzl
-index 0000000..0000000 100644
---- a/internal/architectures.bzl
-+++ b/internal/architectures.bzl
-@@ -9,7 +9,7 @@ def linux_architectures():
-             arch = "x86",
-             compact_vars = {
-                 "ARCH_CORE": "",
--                "ARCH_DRIVERS": "arch/x86/pci/ arch/x86/power/ arch/x86/video/",
-+                "ARCH_DRIVERS": "arch/x86/pci/ arch/x86/power/",
-                 "ARCH_LIB": "lib/ arch/x86/lib/",
-                 "BITS": "64",
-                 "PROFILING": "",
-diff --git a/internal/linux_objects.bzl b/internal/linux_objects.bzl
-index 0000000..0000000 100644
---- a/internal/linux_objects.bzl
-+++ b/internal/linux_objects.bzl
-@@ -3714,7 +3714,7 @@ def _linux_real_compact_image_impl(ctx, object_infos):
-     out = ctx.actions.declare_file(ctx.label.name + ".vmlinux.a")
-     object_outputs = [info.output for info in object_infos]
-     args = ctx.actions.args()
--    args.add("cDPrST")
-+    args.add("cDPrS")
-     args.add(out)
-     args.add_all(object_outputs)
-     ctx.actions.run(
-diff --git a/internal/linux.bzl b/internal/linux.bzl
-index 0000000..0000000 100644
---- a/internal/linux.bzl
-+++ b/internal/linux.bzl
-@@ -58,5 +58,6 @@ def linux(
-     native.alias(
-         name = name,
-         actual = select(actuals),
-+        tags = tags,
-         visibility = visibility,
-     )
-@@ -112,5 +112,6 @@ def _define_arch_kernel(
-             arch = arch.config_name,
-             requested = image_format,
-             target_compatible_with = [arch.platform],
-+            tags = tags,
-         )
-         return ":" + unsupported_image_format_target

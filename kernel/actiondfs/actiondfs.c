@@ -1743,7 +1743,7 @@ static ssize_t actiondfs_copy_file_range(struct file *file_in, loff_t pos_in,
 	}
 
 	actiondfs_stat_inc(ACTIONDFS_STAT_STAGE_COPY_FILE_RANGE_FALLBACKS);
-	return -EREMOTEIO;
+	return copied;
 }
 
 static ssize_t actiondfs_splice_read(struct file *actiondfs_file, loff_t *ppos,

@@ -1,1 +1,6 @@
 package(default_visibility = ["//visibility:public"])
+
+config_setting(
+    name = "compilation_mode_opt",
+    values = {"compilation_mode": "opt"},
+)
