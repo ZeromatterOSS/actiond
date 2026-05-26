@@ -27,6 +27,7 @@ Environment:
   ACTIOND_VM_ALLOW_TCG=1
   ACTIOND_VM_QEMU_CACHE=none
   ACTIOND_VM_QEMU_AIO=io_uring
+  ACTIOND_VM_QEMU_BLOCK_QUEUES=4
   ACTIOND_E2E_BARE_COUNT=160
   ACTIOND_E2E_SOURCE_DIRS=8
   ACTIOND_E2E_SOURCE_FILES_PER_DIR=32
@@ -38,6 +39,7 @@ Environment:
   ACTIOND_E2E_LIBC=glibc2.35
   ACTIOND_E2E_REMOTE_GRPC_LOG=/path/to/remote_grpc.log
   ACTIOND_E2E_ACTIONDFS_STATS_PATH=/path/to/actiondfs_stats.txt
+  ACTIOND_E2E_SERVER_SUDO=1
 EOF
 }
 
@@ -46,6 +48,7 @@ e2e_port="${ACTIOND_E2E_PORT:-8980}"
 endpoint="${e2e_host}:${e2e_port}"
 e2e_server_pid=""
 e2e_server_process_group=0
+e2e_server_sudo=0
 e2e_root=""
 e2e_log=""
 e2e_log_label="actiond log"
@@ -81,7 +84,11 @@ cleanup_e2e_server() {
   if [[ -n "${e2e_root}" && "$(uname -s)" == "Linux" ]]; then
     local runtime_mount="${e2e_root}/server/runtimes"
     if [[ -d "${runtime_mount}" ]] && awk -v path="${runtime_mount}" '$5 == path { found = 1 } END { exit(found ? 0 : 1) }' /proc/self/mountinfo; then
-      umount -l "${runtime_mount}" >/dev/null 2>&1 || true
+      if [[ "${e2e_server_sudo}" == "1" ]]; then
+        sudo -n umount -l "${runtime_mount}" >/dev/null 2>&1 || true
+      else
+        umount -l "${runtime_mount}" >/dev/null 2>&1 || true
+      fi
     fi
   fi
   if [[ -n "${e2e_root}" ]]; then
@@ -89,12 +96,21 @@ cleanup_e2e_server() {
       echo "kept e2e root: ${e2e_root}" >&2
       last_e2e_root="${e2e_root}"
     else
-      rm -rf "${e2e_root}"
+      if [[ "${e2e_server_sudo}" == "1" ]]; then
+        if ! sudo -n rm -rf "${e2e_root}" >/dev/null 2>&1; then
+          if ! rm -rf "${e2e_root}" >/dev/null 2>&1; then
+            echo "warning: failed to remove e2e root ${e2e_root}; cleanup may require sudo" >&2
+          fi
+        fi
+      else
+        rm -rf "${e2e_root}"
+      fi
       last_e2e_root=""
     fi
   fi
   e2e_server_pid=""
   e2e_server_process_group=0
+  e2e_server_sudo=0
   e2e_root=""
   e2e_log=""
 }
@@ -202,7 +218,6 @@ run_stress_workspace() {
       --bes_upload_mode=nowait_for_upload_complete \
       --remote_executor="grpc://${endpoint}" \
       --remote_cache="grpc://${endpoint}" \
-      --remote_default_exec_properties=libc=glibc2.35 \
       --noremote_accept_cached \
       --remote_local_fallback=false \
       --remote_upload_local_results=false \
@@ -265,7 +280,12 @@ run_linux_e2e() {
   fi
   local log="${root}/linux-actiond.log"
 
-  "${server}" serve "${server_args[@]}" >"${log}" 2>&1 &
+  if [[ "${ACTIOND_E2E_SERVER_SUDO:-0}" == "1" ]]; then
+    e2e_server_sudo=1
+    sudo -n "${server}" serve "${server_args[@]}" >"${log}" 2>&1 &
+  else
+    "${server}" serve "${server_args[@]}" >"${log}" 2>&1 &
+  fi
   e2e_server_pid="$!"
   e2e_root="${root}"
   e2e_log="${log}"
@@ -309,6 +329,7 @@ run_linux_vm_e2e() {
     --memory-mib="${ACTIOND_VM_MEMORY_MIB:-1024}"
     --cpus="${ACTIOND_VM_CPUS:-4}"
     --qemu="${ACTIOND_VM_QEMU:-qemu-system-x86_64}"
+    --qemu-machine="${ACTIOND_VM_QEMU_MACHINE:-q35}"
     --guest-cid="${ACTIOND_VM_GUEST_CID:-42}"
     --qemu-cache="${ACTIOND_VM_QEMU_CACHE:-none}"
     --actiondfs-stats-path="${stats_path}"
@@ -316,13 +337,16 @@ run_linux_vm_e2e() {
   if [[ -n "${ACTIOND_VM_QEMU_AIO:-}" ]]; then
     server_args+=(--qemu-aio="${ACTIOND_VM_QEMU_AIO}")
   fi
+  if [[ -n "${ACTIOND_VM_QEMU_BLOCK_QUEUES:-}" ]]; then
+    server_args+=(--qemu-block-queues="${ACTIOND_VM_QEMU_BLOCK_QUEUES}")
+  fi
   if [[ "${ACTIOND_VM_ALLOW_TCG:-0}" == "1" ]]; then
     server_args+=(--allow-tcg)
   fi
 
   if [[ "${ACTIOND_E2E_STANDALONE:-0}" == "1" ]]; then
-    run_bazel build //cmd/linux_actiond:linux-actiond-standalone_pkg
-    server="$(bazel_output //cmd/linux_actiond:linux-actiond-standalone_pkg)"
+    run_bazel build //cmd/linux_actiond:linux-actiond-vm-standalone_pkg
+    server="$(bazel_output //cmd/linux_actiond:linux-actiond-vm-standalone_pkg)"
   else
     run_bazel build \
       //cmd/linux_actiond:linux-actiond \

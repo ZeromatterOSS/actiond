@@ -174,8 +174,8 @@ Initial implementation may use `aio=threads` or omit `aio` if `io_uring` is not
 available on common worker hosts. Make this configurable and measure before
 making `io_uring` a hard dependency.
 
-6. Add `serve-vm` to the Linux standalone entrypoint:
-   - preferred minimal user surface: `linux-actiond-standalone serve-vm ...`
+6. Add `serve-vm` to the Linux VM standalone entrypoint:
+   - preferred minimal user surface: `linux-actiond-vm-standalone serve-vm ...`
    - keep `linux-actiond-standalone serve ...` as the direct host path
    - if we want to preserve the current macOS naming in scripts, add a
      cross-platform `actiond-vm-host-standalone` alias later rather than
@@ -238,7 +238,7 @@ Phase 1, build/unit:
 bazel build //cmd/linux_actiond_guest:linux-actiond-guest-x86_64
 bazel build //vm:linux_kernel_x86_64_zst
 bazel build //vm:initramfs_x86_64
-bazel build //cmd/linux_actiond:linux-actiond-standalone_pkg
+bazel build //cmd/linux_actiond:linux-actiond-vm-standalone_pkg
 bazel test //src:unit_tests
 ```
 
@@ -246,7 +246,7 @@ Phase 2, boot smoke:
 
 ```bash
 tools/create_ext4_image.sh /tmp/actiond-qemu-cas.ext4 8192
-linux-actiond-standalone serve-vm \
+linux-actiond-vm-standalone serve-vm \
   --listen=127.0.0.1:8998 \
   --root=/tmp/actiond-qemu-vm \
   --cas-image=/tmp/actiond-qemu-cas.ext4 \
@@ -311,7 +311,7 @@ macOS.
 
 ## Open Questions
 
-- Should the Linux VM frontend live under `linux-actiond-standalone serve-vm`,
+- Should the Linux VM frontend live under `linux-actiond-vm-standalone serve-vm`,
   or should the project introduce a neutral `actiond-vm-host` binary and keep
   `darwin-actiond` as a compatibility wrapper?
 - Should the first QEMU backend require `vhost-vsock-pci`, or allow

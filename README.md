@@ -52,8 +52,8 @@ On macOS:
 On Linux x86_64 with KVM:
 
 ```bash
-bazel build //cmd/linux_actiond:linux-actiond-standalone_pkg
-bazel-bin/cmd/linux_actiond/linux-actiond-standalone serve-vm \
+bazel build //cmd/linux_actiond:linux-actiond-vm-standalone_pkg
+bazel-bin/cmd/linux_actiond/linux-actiond-vm-standalone serve-vm \
   --listen=127.0.0.1:8980 \
   --root=/tmp/actiond-vm \
   --cas-image=/tmp/actiond-vm/cas.ext4
@@ -122,8 +122,7 @@ Most users should use releases. Source builds are mainly for development:
 
 ```bash
 bazel build --config=remote -c opt //cmd/darwin-actiond
-bazel build --config=remote -c opt //cmd/linux_actiond:linux-actiond-standalone_pkg \
-  --platforms=//platforms:linux_x86_64
+bazel build --config=remote -c opt //cmd/linux_actiond:linux-actiond-vm-standalone_pkg
 ```
 
 Normal contributor checks:

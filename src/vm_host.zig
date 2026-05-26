@@ -40,10 +40,12 @@ pub const ServeVmOptions = struct {
 pub const ServeQemuVmOptions = struct {
     common: ServeVmOptions = .{},
     qemu_path: []const u8 = "qemu-system-x86_64",
+    qemu_machine: qemu_vm.MachineModel = .q35,
     guest_cid: u32 = 42,
     allow_tcg: bool = false,
     qemu_cache: []const u8 = "none",
-    qemu_aio: ?[]const u8 = null,
+    qemu_aio: ?[]const u8 = qemu_vm.default_drive_aio,
+    qemu_block_queues: ?u32 = null,
 };
 
 pub fn parseServeVmArgs(args: []const []const u8) !ServeVmOptions {
@@ -145,6 +147,12 @@ pub fn parseServeQemuVmArgs(args: []const []const u8) !ServeQemuVmOptions {
             options.qemu_path = args[i];
         } else if (std.mem.startsWith(u8, arg, "--qemu=")) {
             options.qemu_path = arg["--qemu=".len..];
+        } else if (std.mem.eql(u8, arg, "--qemu-machine")) {
+            i += 1;
+            if (i >= args.len) return error.MissingServeArgumentValue;
+            options.qemu_machine = try qemu_vm.MachineModel.parse(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--qemu-machine=")) {
+            options.qemu_machine = try qemu_vm.MachineModel.parse(arg["--qemu-machine=".len..]);
         } else if (std.mem.eql(u8, arg, "--guest-cid")) {
             i += 1;
             if (i >= args.len) return error.MissingServeArgumentValue;
@@ -165,6 +173,12 @@ pub fn parseServeQemuVmArgs(args: []const []const u8) !ServeQemuVmOptions {
             options.qemu_aio = args[i];
         } else if (std.mem.startsWith(u8, arg, "--qemu-aio=")) {
             options.qemu_aio = arg["--qemu-aio=".len..];
+        } else if (std.mem.eql(u8, arg, "--qemu-block-queues")) {
+            i += 1;
+            if (i >= args.len) return error.MissingServeArgumentValue;
+            options.qemu_block_queues = try parseU32(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--qemu-block-queues=")) {
+            options.qemu_block_queues = try parseU32(arg["--qemu-block-queues=".len..]);
         } else {
             try filtered.append(std.heap.smp_allocator, arg);
         }
@@ -262,11 +276,13 @@ fn serveWithMachine(
             .start_timeout_ms = options.start_timeout_ms,
             .connect_timeout_ms = options.connect_timeout_ms,
             .qemu_path = qemu_options.qemu_path,
+            .qemu_machine = qemu_options.qemu_machine,
             .guest_cid = qemu_options.guest_cid,
             .allow_tcg = qemu_options.allow_tcg,
             .format_cas_image = format_cas_image,
             .drive_cache = qemu_options.qemu_cache,
             .drive_aio = qemu_options.qemu_aio,
+            .block_queue_count = qemu_options.qemu_block_queues,
         })
     else
         try darwin_vm.Machine.start(io, allocator, .{
@@ -530,19 +546,30 @@ test "parseServeQemuVmArgs accepts QEMU flags" {
         "--kernel=/tmp/bzImage",
         "--initramfs=/tmp/initramfs.cpio.zst",
         "--qemu=/usr/bin/qemu-system-x86_64",
+        "--qemu-machine=microvm",
         "--guest-cid=43",
         "--qemu-cache=none",
         "--qemu-aio=io_uring",
+        "--qemu-block-queues=8",
         "--allow-tcg",
     });
 
     try std.testing.expectEqualStrings("/tmp/bzImage", options.common.kernel.?);
     try std.testing.expectEqualStrings("/tmp/initramfs.cpio.zst", options.common.initramfs.?);
     try std.testing.expectEqualStrings("/usr/bin/qemu-system-x86_64", options.qemu_path);
+    try std.testing.expectEqual(qemu_vm.MachineModel.microvm, options.qemu_machine);
     try std.testing.expectEqual(@as(u32, 43), options.guest_cid);
     try std.testing.expectEqualStrings("none", options.qemu_cache);
     try std.testing.expectEqualStrings("io_uring", options.qemu_aio.?);
+    try std.testing.expectEqual(@as(u32, 8), options.qemu_block_queues.?);
     try std.testing.expect(options.allow_tcg);
+}
+
+test "parseServeQemuVmArgs defaults QEMU to cache none with io_uring" {
+    const options = try parseServeQemuVmArgs(&.{});
+    try std.testing.expectEqualStrings("none", options.qemu_cache);
+    try std.testing.expectEqualStrings("io_uring", options.qemu_aio.?);
+    try std.testing.expectEqual(@as(?u32, null), options.qemu_block_queues);
 }
 
 test "serveQemu requires an explicitly formatted CAS image" {

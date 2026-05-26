@@ -6,3 +6,8 @@ bool_flag(
     name = "executor_timing_logs",
     build_setting_default = False,
 )
+
+config_setting(
+    name = "compilation_mode_opt",
+    values = {"compilation_mode": "opt"},
+)

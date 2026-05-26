@@ -4,6 +4,7 @@ const control_transport_fd = @import("control_transport_fd.zig");
 const vsock = @import("vsock.zig");
 
 const linux = std.os.linux;
+pub const default_drive_aio = "io_uring";
 
 pub const Error = error{
     ConnectFailed,
@@ -26,11 +27,24 @@ pub const Options = struct {
     connect_timeout_ms: u32 = 60_000,
     connect_attempt_timeout_ms: u32 = 1_000,
     qemu_path: []const u8 = "qemu-system-x86_64",
+    qemu_machine: MachineModel = .q35,
     guest_cid: u32 = 42,
     allow_tcg: bool = false,
     format_cas_image: bool = false,
     drive_cache: []const u8 = "none",
-    drive_aio: ?[]const u8 = null,
+    drive_aio: ?[]const u8 = default_drive_aio,
+    block_queue_count: ?u32 = null,
+};
+
+pub const MachineModel = enum {
+    q35,
+    microvm,
+
+    pub fn parse(value: []const u8) !MachineModel {
+        if (std.mem.eql(u8, value, "q35")) return .q35;
+        if (std.mem.eql(u8, value, "microvm")) return .microvm;
+        return error.UnsupportedQemuMachine;
+    }
 };
 
 pub const Machine = struct {
@@ -53,10 +67,22 @@ pub const Machine = struct {
         defer allocator.free(memory);
         const cpus = try std.fmt.allocPrint(allocator, "{d}", .{options.cpu_count});
         defer allocator.free(cpus);
-        const machine_arg = if (options.allow_tcg) "q35,accel=tcg" else "q35,accel=kvm";
-        const cpu_arg = if (options.allow_tcg) "max" else "host";
-        const vsock_device = try std.fmt.allocPrint(allocator, "vhost-vsock-pci,id=vsock0,guest-cid={d}", .{options.guest_cid});
+        const machine_arg = qemuMachineArg(options.qemu_machine, options.allow_tcg);
+        const cpu_arg = qemuCpuArg(options.qemu_machine, options.allow_tcg);
+        const vsock_driver = switch (options.qemu_machine) {
+            .q35 => "vhost-vsock-pci",
+            .microvm => "vhost-vsock-device",
+        };
+        const block_driver = switch (options.qemu_machine) {
+            .q35 => "virtio-blk-pci",
+            .microvm => "virtio-blk-device",
+        };
+        const vsock_device = try std.fmt.allocPrint(allocator, "{s},id=vsock0,guest-cid={d}", .{ vsock_driver, options.guest_cid });
         defer allocator.free(vsock_device);
+        const cas_block_device = try blockDeviceArg(allocator, block_driver, "cas", options.block_queue_count);
+        defer allocator.free(cas_block_device);
+        const runtime_block_device = try blockDeviceArg(allocator, block_driver, "runtimes", options.block_queue_count);
+        defer allocator.free(runtime_block_device);
         const cas_drive = try driveArg(allocator, "cas", options.cas_image_path, false, options.drive_cache, options.drive_aio);
         defer allocator.free(cas_drive);
         const runtime_drive = try driveArg(allocator, "runtimes", runtime_image_path, true, options.drive_cache, options.drive_aio);
@@ -79,9 +105,9 @@ pub const Machine = struct {
             "-append", kernel_append,
             "-device", vsock_device,
             "-drive", cas_drive,
-            "-device", "virtio-blk-pci,drive=cas",
+            "-device", cas_block_device,
             "-drive", runtime_drive,
-            "-device", "virtio-blk-pci,drive=runtimes",
+            "-device", runtime_block_device,
         };
 
         var child = try std.process.spawn(io, .{
@@ -154,6 +180,21 @@ pub const Machine = struct {
     }
 };
 
+fn qemuMachineArg(machine: MachineModel, allow_tcg: bool) []const u8 {
+    return switch (machine) {
+        .q35 => if (allow_tcg) "q35,accel=tcg" else "q35,accel=kvm",
+        .microvm => if (allow_tcg) "microvm,accel=tcg,pit=on,rtc=on,pic=on" else "microvm,accel=kvm,pit=on,rtc=on,pic=on",
+    };
+}
+
+fn qemuCpuArg(machine: MachineModel, allow_tcg: bool) []const u8 {
+    if (allow_tcg) return "max";
+    return switch (machine) {
+        .q35 => "host",
+        .microvm => "host,migratable=off,+invtsc",
+    };
+}
+
 fn driveArg(
     allocator: std.mem.Allocator,
     id: []const u8,
@@ -178,6 +219,18 @@ fn driveArg(
         readonly_arg,
         cache,
     });
+}
+
+fn blockDeviceArg(
+    allocator: std.mem.Allocator,
+    driver: []const u8,
+    drive_id: []const u8,
+    queue_count: ?u32,
+) ![]u8 {
+    if (queue_count) |queues| {
+        return std.fmt.allocPrint(allocator, "{s},drive={s},num-queues={d}", .{ driver, drive_id, queues });
+    }
+    return std.fmt.allocPrint(allocator, "{s},drive={s}", .{ driver, drive_id });
 }
 
 fn connectVsock(cid: u32, port: u32) !std.posix.fd_t {
@@ -257,4 +310,18 @@ test "kernelAppendArg can request guest CAS formatting" {
     const formatted = try kernelAppendArg(std.testing.allocator, true);
     defer std.testing.allocator.free(formatted);
     try std.testing.expectEqualStrings("console=ttyS0 panic=-1 actiond.format_cas=1", formatted);
+}
+
+test "qemuMachineArg selects KVM or TCG accelerators" {
+    try std.testing.expectEqualStrings("q35,accel=kvm", qemuMachineArg(.q35, false));
+    try std.testing.expectEqualStrings("q35,accel=tcg", qemuMachineArg(.q35, true));
+    try std.testing.expectEqualStrings("microvm,accel=kvm,pit=on,rtc=on,pic=on", qemuMachineArg(.microvm, false));
+    try std.testing.expectEqualStrings("microvm,accel=tcg,pit=on,rtc=on,pic=on", qemuMachineArg(.microvm, true));
+}
+
+test "qemuCpuArg exposes invariant TSC for KVM microvm" {
+    try std.testing.expectEqualStrings("host", qemuCpuArg(.q35, false));
+    try std.testing.expectEqualStrings("host,migratable=off,+invtsc", qemuCpuArg(.microvm, false));
+    try std.testing.expectEqualStrings("max", qemuCpuArg(.q35, true));
+    try std.testing.expectEqualStrings("max", qemuCpuArg(.microvm, true));
 }

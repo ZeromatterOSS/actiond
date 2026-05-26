@@ -776,9 +776,6 @@ pub fn serveDispatcher(
     try stderr.print("actiond gRPC listening on {s}\n", .{config.listen});
     try stderr.flush();
 
-    var connections: std.Io.Group = .init;
-    defer connections.cancel(io);
-
     while (true) {
         const stream = listener.accept(io) catch |err| {
             if (err == error.Canceled) return err;
@@ -788,7 +785,7 @@ pub fn serveDispatcher(
             continue;
         };
         setTcpNoDelay(stream) catch {};
-        connections.concurrent(io, connectionTask, .{
+        const thread = std.Thread.spawn(.{}, connectionThread, .{
             io,
             allocator,
             dispatcher,
@@ -801,10 +798,11 @@ pub fn serveDispatcher(
             sleepMilliseconds(io, 10) catch {};
             continue;
         };
+        thread.detach();
     }
 }
 
-fn connectionTask(
+fn connectionThread(
     io: std.Io,
     allocator: std.mem.Allocator,
     dispatcher: Dispatcher,

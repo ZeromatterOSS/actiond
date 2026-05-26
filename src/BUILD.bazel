@@ -1,4 +1,5 @@
 load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
+load("//:zig_opts.bzl", "actiond_zigopts")
 load("//tools:build_options.bzl", "zig_build_options")
 
 zig_build_options(
@@ -60,6 +61,7 @@ zig_library(
         "@zstd",
     ],
     visibility = ["//visibility:public"],
+    zigopts = actiond_zigopts(),
 )
 
 zig_test(
@@ -107,4 +109,5 @@ zig_test(
         ":build_options",
         "@zstd",
     ],
+    zigopts = actiond_zigopts(),
 )

@@ -20,11 +20,16 @@ server_log="${ACTIOND_LLVM_SMOKE_SERVER_LOG:-}"
 measured_server_log="${ACTIOND_LLVM_SMOKE_MEASURED_SERVER_LOG:-}"
 remote_grpc_log="${ACTIOND_LLVM_SMOKE_REMOTE_GRPC_LOG:-}"
 output_base="${ACTIOND_LLVM_SMOKE_OUTPUT_BASE:-}"
-startup_flags=()
+bazel_startup_flags=()
 if [[ -n "${output_base}" ]]; then
   mkdir -p "${output_base}"
-  startup_flags=(--output_base="${output_base}")
+  bazel_startup_flags+=(--output_base="${output_base}")
 fi
+if [[ -n "${ACTIOND_LLVM_SMOKE_BAZEL_STARTUP_FLAGS:-}" ]]; then
+  read -r -a extra_bazel_startup_flags <<<"${ACTIOND_LLVM_SMOKE_BAZEL_STARTUP_FLAGS}"
+  bazel_startup_flags+=("${extra_bazel_startup_flags[@]}")
+fi
+bazel_cmd=(bazel "${bazel_startup_flags[@]}")
 build_mode_flags=(
   -c opt
   --strip=always
@@ -57,7 +62,7 @@ build_remote() {
   if [[ -n "${remote_grpc_log}" ]]; then
     bazel_args+=(--remote_grpc_log="${remote_grpc_log}")
   fi
-  bazel "${startup_flags[@]}" "${bazel_args[@]}" \
+  "${bazel_cmd[@]}" "${bazel_args[@]}" \
     --remote_local_fallback=false \
     --remote_upload_local_results=false \
     --disk_cache= \
@@ -67,7 +72,7 @@ build_remote() {
 }
 
 if [[ "${ACTIOND_LLVM_SMOKE_SKIP_CLEAN:-0}" != "1" ]]; then
-  bazel "${startup_flags[@]}" clean --expunge
+  "${bazel_cmd[@]}" clean --expunge
 fi
 
 if [[ -n "${warmup_target}" ]]; then
@@ -81,11 +86,7 @@ if [[ -n "${server_log}" && -n "${measured_server_log}" && -f "${server_log}" ]]
 fi
 
 echo "LLVM smoke measured build: ${target}" >&2
-if [[ -n "${warmup_target}" ]]; then
-  build_remote "${target}" 1 toplevel
-else
-  build_remote "${target}" 0 toplevel
-fi
+build_remote "${target}" 0 toplevel
 
 if [[ -n "${server_log}" && -n "${measured_server_log}" && -f "${server_log}" ]]; then
   tail -c "+$((measured_offset + 1))" "${server_log}" >"${measured_server_log}"
