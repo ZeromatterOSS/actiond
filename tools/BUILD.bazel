@@ -3,6 +3,16 @@ load("@rules_zig//zig:defs.bzl", "zig_binary", "zig_test")
 load("//:zig_opts.bzl", "actiond_zigopts")
 
 zig_binary(
+    name = "actiondfs_fuse",
+    linkopts = ["-lc"],
+    main = "actiondfs_fuse.zig",
+    strip_debug_symbols = True,
+    visibility = ["//visibility:public"],
+    zigopts = actiond_zigopts(),
+    deps = ["//src:actiond"],
+)
+
+zig_binary(
     name = "initramfs_newc",
     linkopts = ["-lc"],
     main = "initramfs_newc.zig",

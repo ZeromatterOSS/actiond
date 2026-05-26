@@ -49,6 +49,192 @@ subset of the VM `llvm-tblgen` graph.
 - VM Bazel processes: `2310 processes: 4 action cache hit, 204 internal, 2106 remote`
 - Mac-host baseline: not run for this VM-focused actiondfs staging check
 
+## Latest Linux QEMU/KVM Result
+
+These runs use `linux-actiond serve-vm` with QEMU/KVM on Linux x86_64. The
+workload is the same `@llvm-project//llvm:llvm-tblgen` smoke with a fresh VM
+worker, 16 vCPUs, `--jobs=16`, optimized Zig code, native CPU codegen, and
+`q35` unless otherwise noted.
+
+The key tuning result on 2026-05-25 was the QEMU block backend. Keeping
+`cache=none` but adding `aio=io_uring` moved the QEMU/KVM path from the
+previous `121.914s` `cache=none` baseline and `81.258s` `cache=writeback`
+throughput probe into the same band as the optimized Linux FUSE path, without
+requiring writeback caching.
+
+| Output root | QEMU cache | QEMU aio | Block queues | Bazel elapsed | Input fetch p50 | Process/io p50 | Process/io p95 | Fixed overhead p50 | Fixed overhead p95 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `/var/home/wgray/actiond-llvm-smokes/qemu-q35-none-iouring-j16-20260525-165821` | `none` | `io_uring` | default | `55.682s` | `0.826ms` | `40.761ms` | `1656.229ms` | `6.564ms` | `30.501ms` |
+| `/var/home/wgray/actiond-llvm-smokes/qemu-q35-none-iouring-j16-repeat-20260525-170026` | `none` | `io_uring` | default | `57.063s` | `0.790ms` | `42.458ms` | `1678.937ms` | `6.052ms` | `35.304ms` |
+| `/var/home/wgray/actiond-llvm-smokes/qemu-q35-none-defaultaio-j16-20260525-171006` | `none` | default `io_uring` | default | `62.162s` | `0.712ms` | `40.785ms` | `1863.243ms` | `7.621ms` | `40.846ms` |
+| `/var/home/wgray/actiond-llvm-smokes/qemu-q35-none-defaultaio-j16-repeat-20260525-171324` | `none` | default `io_uring` | default | `58.491s` | `0.762ms` | `37.253ms` | `1684.048ms` | `5.064ms` | `25.833ms` |
+| `/var/home/wgray/actiond-llvm-smokes/qemu-q35-none-iouring-queues16-j16-20260525-172553` | `none` | default `io_uring` | 16 | `54.117s` | `0.733ms` | `34.017ms` | `1606.596ms` | `5.279ms` | `27.445ms` |
+| `/var/home/wgray/actiond-llvm-smokes/qemu-q35-none-iouring-queues16-j16-repeat-20260525-172909` | `none` | default `io_uring` | 16 | `56.711s` | `0.769ms` | `45.859ms` | `1630.011ms` | `5.747ms` | `31.623ms` |
+| `/var/home/wgray/actiond-llvm-smokes/qemu-q35-none-iouring-queues8-j16-20260525-173314` | `none` | default `io_uring` | 8 | `55.144s` | `0.770ms` | `36.861ms` | `1591.519ms` | `6.068ms` | `31.547ms` |
+| `/var/home/wgray/actiond-llvm-smokes/qemu-q35-none-iouring-queues4-j16-20260525-173113` | `none` | default `io_uring` | 4 | `56.501s` | `0.819ms` | `40.189ms` | `1621.113ms` | `5.440ms` | `35.292ms` |
+| `/var/home/wgray/actiond-llvm-smokes/qemu-q35-writeback-iouring-j16-20260525-165401` | `writeback` | `io_uring` | default | `53.217s` | `0.742ms` | `34.489ms` | `1590.465ms` | `5.644ms` | `24.625ms` |
+| `/var/home/wgray/actiond-llvm-smokes/qemu-q35-writeback-iouring-j16-repeat-20260525-165616` | `writeback` | `io_uring` | default | `58.311s` | `0.754ms` | `41.177ms` | `1703.801ms` | `5.495ms` | `36.059ms` |
+
+`cache=none,aio=io_uring` is the preferred default because it gets the large
+I/O backend win while preserving the stricter cache mode. `cache=writeback`
+remains available as an explicit flag for local experiments where host-crash
+durability of the VM disk image is less important than a possible small
+throughput gain. Explicit virtio-blk multiqueue probes with
+`--qemu-block-queues=4|8|16` were valid and the guest reported the requested
+queue counts, but the gains were small and noisy, so block queue count remains
+an explicit tuning knob instead of a default. A q35 CPU override probe with
+`host,migratable=off,+invtsc` measured `59.592s`, so it was not kept.
+
+## Latest Native Linux FUSE Result
+
+These runs use the Linux FUSE actiondfs smoke wrapper, not `serve-vm`:
+
+```bash
+ACTIOND_LLVM_LINUX_MODE=fuse e2e/run_llvm_linux_smoke.sh
+```
+
+The first set was collected on 2026-05-24 after persistent FUSE registry mode,
+cached directory templates, stable immutable input file nodes, and lazy CAS blob
+open validation. Later the measured invocation was changed to always pass
+`--noremote_accept_cached`, avoiding about 1,998 measured action-cache miss
+RPCs, and the Linux FUSE smoke default was tuned to `ACTIOND_LLVM_SMOKE_JOBS=16`
+with a 16-thread helper. The helper now disables its own FUSE stats atomics by
+default; set `ACTIOND_ACTIONDFS_FUSE_STATS=1` when those exit counters are more
+important than the hot-path cost. The benchmarked server/helper binaries use
+optimized Zig `ReleaseFast` and `-mcpu=native`.
+
+Each checked run parsed `1,998` execute records, all in `actiondfs_strict` mode,
+with no `overlayfs`, `mount_overlay`, or `actiondfs_overlay` matches in the
+checked logs.
+
+| Output root | Bazel elapsed | Input fetch p50 | Process/io p50 | Process/io p95 | Fixed overhead p50 | Fixed overhead p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-nostats-threads16-20260524-174012` | `54.246s` | `2.425ms` | `45.040ms` | `1801.146ms` | `7.830ms` | `14.604ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-nostats-threads16-repeat-20260524-174640` | `58.050s` | `2.392ms` | `44.192ms` | `1973.814ms` | `7.578ms` | `15.054ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-default-20260524-175318` | `56.736s` | `2.429ms` | `43.594ms` | `1887.882ms` | `7.654ms` | `14.753ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-copyrange-nostats1-20260524-try3-4` | `56.179s` | `2.457ms` | `45.691ms` | `1849.581ms` | `8.418ms` | `16.013ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-copyrange-nostats2-20260524-try3-4` | `56.112s` | `2.535ms` | `44.718ms` | `1879.764ms` | `8.394ms` | `16.857ms` |
+
+The copy-file-range runs above include a FUSE `copy_file_range` output fast
+path and a ByteStream write parser fast path that avoids copying complete gRPC
+records into a pending buffer when no partial record is buffered. They used
+fresh Bazel workload output bases via
+`ACTIOND_LLVM_SMOKE_BAZEL_STARTUP_FLAGS=--output_base=...` and
+`ACTIOND_LLVM_SMOKE_SKIP_CLEAN=1` because a shared-output-base
+`bazel clean --expunge` run stalled for more than four minutes before any
+measured remote action started. A stats-enabled diagnostic run at
+`/var/mnt/dev/actiond-worker/llvm-smokes/fuse-copyrange-stats2-20260524-try3-4`
+reported `3834` FUSE `copy_file_range` operations, `31180842` copied bytes,
+and zero fallbacks or failures, but elapsed `62.059s` with stats atomics
+enabled. The no-stats wall time stayed in the prior `54-58s` band because
+output collection was already a small part of the workload.
+
+The current FUSE helper also returns `FOPEN_NOFLUSH` for normal file opens. The
+helper's `flush` handler was already a no-op, so this removes close-time FUSE
+round trips and keeps more useful kernel-side file data cached. Two clean
+no-stats confirmation runs after killing stale benchmark Bazel servers measured:
+
+| Output root | Bazel elapsed | Input fetch p50 | Process/io p50 | Process/io p95 | Fixed overhead p50 | Fixed overhead p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-noflush2-20260525-try-order` | `53.693s` | `2.494ms` | `45.206ms` | `1705.075ms` | `8.130ms` | `16.077ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-noflush3-20260525-try-order` | `54.231s` | `2.381ms` | `41.806ms` | `1811.800ms` | `8.071ms` | `15.568ms` |
+
+A stats-enabled diagnostic run at
+`/var/mnt/dev/actiond-worker/llvm-smokes/fuse-noflush-stats-20260525-try-order`
+measured `55.445s` and showed total FUSE requests down to `2,537,951`, with the
+generic `other` bucket down to `487,891` and read requests down to `11,143`.
+The comparable pre-`NOFLUSH` stats diagnostic had `3,090,232` total requests,
+`1,032,901` `other` requests, and `17,569` read requests.
+
+A follow-up on 2026-05-25 removed per-request clock reads from the no-stats
+worker path and writes generic FUSE replies with `writev`, avoiding one
+allocation and payload copy per non-scratch reply. The earlier interrupted
+`writev` retries are excluded; after the system sleep and CPU policy changes
+were out of the way, the clean retry measured:
+
+| Output root | Bazel elapsed | Input fetch p50 | Process/io p50 | Process/io p95 | Fixed overhead p50 | Fixed overhead p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-notiming1-20260525` | `54.178s` | `2.539ms` | `41.110ms` | `1712.956ms` | `8.068ms` | `16.232ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-notiming2-20260525` | `54.504s` | `2.491ms` | `44.394ms` | `1696.185ms` | `7.399ms` | `14.330ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-writev1-20260525` | `55.745s` | `2.365ms` | `45.575ms` | `1689.485ms` | `8.301ms` | `15.461ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-writev4-20260525` | `53.147s` | `2.347ms` | `42.529ms` | `1682.152ms` | `8.201ms` | `15.479ms` |
+
+One more pass on 2026-05-25 looked at the remaining FUSE read path and small
+HTTP/2 allocation overhead. Reusing one inbound frame payload buffer per
+connection, stack-encoding small response header blocks, setting TCP_NODELAY on
+accepted gRPC sockets, and using the scratch read path for CAS reads below
+`64KiB` produced these checked runs:
+
+| Output root | Bazel elapsed | Input fetch p50 | Process/io p50 | Process/io p95 | Fixed overhead p50 | Fixed overhead p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-framebuf1-20260525` | `53.716s` | `2.482ms` | `44.480ms` | `1707.787ms` | `7.795ms` | `15.025ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-splice64k1-20260525` | `52.746s` | `2.408ms` | `37.619ms` | `1728.544ms` | `7.225ms` | `14.257ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/fuse-finalcand2-20260525` | `54.441s` | `2.408ms` | `57.251ms` | `2081.572ms` | `8.615ms` | `17.042ms` |
+
+The `64KiB` splice threshold is now the default. Small reads are cheaper through
+the helper's existing `pread` scratch-buffer reply path than through a
+pipe/splice round trip, while larger reads still use splice. A no-splice probe
+landed at `54.780s`, and a `256KiB` threshold probe landed at `56.994s`, so
+neither was kept. A first final-candidate run at `63.482s` was repeated because
+process/io, fork, and setup medians all inflated together under host load; the
+second run above is the usable confirmation. The checked logs for these runs
+again had no `overlayfs`, `mount_overlay`, or `actiondfs_overlay` matches.
+
+A stats-enabled passthrough retry at
+`/var/mnt/dev/actiond-worker/llvm-smokes/fuse-pt-current-stats-20260525-132425`
+measured `54.537s` with the current correctness-preserving policy. The helper
+negotiated Linux FUSE passthrough, but LLVM's input trees marked every attempted
+CAS open executable, so passthrough remained unused: `opens=0`,
+`skip_executable=468838`. Unsafe content-classification probes that allowed JSON
+config files to passthrough failed during warmup with `open(...): EIO`, including
+variants with `FOPEN_DIRECT_IO` and with executable-marked backing blobs chmodded
+to `0555`, so no passthrough policy change was kept.
+
+The immediate predecessor with only persistent FUSE plus parsed directory
+template caching was `/tmp/actiond-llvm-linux-smoke.ZSLnna`: `98.646s`,
+`0.800ms` input fetch p50, `84.237ms` process/io p50, `4,186,541` FUSE read
+requests, and `310.03GB` of FUSE read replies. The stable-file-node change
+therefore moved repeated CAS input reads into the kernel's FUSE page cache by
+reusing one inode identity per immutable `(name, digest, size, executable)`
+input file across actions.
+
+The immediate predecessor with stable file nodes but eager CAS blob validation
+on every FUSE `open` was `/tmp/actiond-llvm-linux-smoke.UDsrv1`: `80.089s`,
+`0.763ms` input fetch p50, `26.952ms` process/io p50, `12,757` FUSE read
+requests, `358.44MB` of FUSE read replies, and `480,761` CAS blob opens. Lazy
+open validation keeps missing-blob detection on the actual read path and avoids
+hundreds of thousands of open/close pairs for already-described immutable CAS
+inputs.
+
+A `jobs=20` probe landed at `249.153s`, but it was contaminated by unrelated
+slug Rust/C builds and system load above 70; it is recorded only as evidence
+against raising the default while the host is busy. A zero-open/FUSE
+`NO_OPEN_SUPPORT` probe landed at `91.826s` and regressed child setup p95 to
+`165.807ms`, so it is not enabled by default.
+
+## Linux Host Staged-QEMU Check
+
+These runs were collected on 2026-05-24 on the Linux host using the
+`qemu-system-x86_64` binary from the pending rpm-ostree deployment. The booted
+`/usr` did not yet contain QEMU on `PATH`, so the runner used
+`ACTIOND_LLVM_VM_SMOKE_QEMU` plus `LD_LIBRARY_PATH` pointed at the staged
+deployment. QEMU started with `-machine q35,accel=kvm -cpu host -smp 8`.
+
+Both measured builds parsed `1,998` execute records, used `1,998` remote
+actions, and the checked logs had no `overlayfs`, `mount_overlay`, or
+`actiondfs_overlay` matches.
+
+| Output root | Warmup elapsed | Bazel elapsed | Input fetch p50 | Process/io p50 | Process/io p95 | Fixed overhead p50 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/qemu-staged-20260524-134439` | `67.036s` | `89.317s` | `0.498ms` | `21.615ms` | `1180.241ms` | `3.637ms` |
+| `/var/mnt/dev/actiond-worker/llvm-smokes/qemu-staged-repeat-20260524-135527` | `65.635s` | `85.494s` | `0.489ms` | `21.802ms` | `1196.735ms` | `3.169ms` |
+
+Current persistent Linux FUSE is still faster end-to-end on this host
+(`52.746-54.441s` in the latest checked 16-job runs) even though the VM path has
+lower median per-action `process/io`. This points at aggregate remote
+execution, bridge, or guest scheduling overhead as the next VM-side comparison
+point, not input materialization.
+
 ## Run Comparison
 
 This compares the previous VFS-backed `copy_file_range` run, where the

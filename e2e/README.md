@@ -45,6 +45,9 @@ to `/tmp/actiond-last-llvm-vm-smoke-path`. Set `ACTIOND_LLVM_SMOKE_MAC_HOST=0`
 to skip the mac-host baseline, or `ACTIOND_LLVM_SMOKE_VM=0` to run only the
 mac-host baseline. The runner defaults to `ACTIOND_LLVM_SMOKE_JOBS=8` for
 stable comparisons; set it to an empty value to let Bazel choose its default.
+When building the benchmark server, the runner forces Zig `ReleaseFast` and
+`-mcpu=native` in addition to the Bazel build mode so measured actiond code is
+optimized for the local processor.
 By default the VM run first builds
 `//e2e:llvm_exec_warmup`, which transitions `@llvm-project//llvm:llvm-min-tblgen`
 to the Linux-musl exec configuration. Aquery shows that target exactly matches
@@ -77,3 +80,29 @@ mostly from Linux-musl exec-configuration actions needed by the VM build. The
 2,403 action keys as the Linux exec-config subset of `llvm-tblgen`. As a split
 warmup, `resource_directory` also exposes Bazel TreeArtifact materialization
 differences that can make the later link miss `libclang_rt.builtins.a`.
+
+## LLVM Linux Native Smoke Runner
+
+`run_llvm_linux_smoke.sh` starts a fresh direct Linux `linux-actiond serve`
+worker and runs the same LLVM tblgen smoke. It is useful for comparing the
+native materialized path and the experimental native FUSE actiondfs helper,
+which mounts strict staged actiondfs directly without overlayfs, against the
+QEMU/kernel actiondfs path:
+
+```bash
+ACTIOND_LLVM_LINUX_MODE=fuse e2e/run_llvm_linux_smoke.sh
+ACTIOND_LLVM_LINUX_MODE=materialized e2e/run_llvm_linux_smoke.sh
+```
+
+The runner uses Linux x86_64 musl target, host, and exec platforms by default,
+builds the server/helper with `-c opt --strip=always --stripopt=--strip-all`,
+and forces Zig `ReleaseFast -mcpu=native` for the benchmarked binaries. The
+FUSE mode defaults to `ACTIOND_LLVM_SMOKE_JOBS=16`; override with
+`ACTIOND_LLVM_SMOKE_JOBS` when sweeping workload concurrency. The FUSE helper
+defaults to 16 worker threads and keeps its exit stats disabled on the hot path;
+use `ACTIOND_ACTIONDFS_FUSE_THREADS` or `ACTIOND_ACTIONDFS_FUSE_STATS=1` for
+targeted experiments. The runner writes the latest output directory to
+`/tmp/actiond-last-llvm-linux-smoke-path`. It starts the worker through
+`sudo -n` by default because direct Linux execution needs mount, chroot, cgroup,
+and FUSE privileges; set `ACTIOND_LLVM_LINUX_SMOKE_SERVER_SUDO=0` if the
+current user already has the required permissions.

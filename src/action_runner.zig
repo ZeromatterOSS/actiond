@@ -68,6 +68,7 @@ pub const ActiondfsStrictMount = struct {
     target: [:0]u8,
     stage_dir: [:0]u8,
     actiondfs_data: [:0]u8,
+    mount_in_child: bool = true,
 };
 
 pub const ActiondfsOverlayMount = struct {
@@ -290,41 +291,54 @@ fn prepareChrootWritableDirs(
     chroot_dir: []const u8,
     uid: u32,
     gid: u32,
+    skip_paths: []const []const u8,
 ) !void {
-    _ = allocator;
     if (comptime builtin.os.tag != .linux) return;
     if (std.os.linux.geteuid() != 0) return;
 
     var root = try std.Io.Dir.openDirAbsolute(io, chroot_dir, .{ .iterate = true });
     defer root.close(io);
     try makeDirectoryWritableBySandbox(root.handle, uid, gid);
-    try prepareChrootWritableSubdirs(io, root, uid, gid);
+    try prepareChrootWritableSubdirs(io, allocator, root, chroot_dir, uid, gid, skip_paths);
 }
 
 fn prepareChrootWritableSubdirs(
     io: std.Io,
+    allocator: std.mem.Allocator,
     dir: std.Io.Dir,
+    dir_path: []const u8,
     uid: u32,
     gid: u32,
+    skip_paths: []const []const u8,
 ) !void {
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
+        const child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+        defer allocator.free(child_path);
+        if (shouldSkipWritableDir(child_path, skip_paths)) continue;
         var child = try dir.openDir(io, entry.name, .{ .iterate = true });
         errdefer child.close(io);
         try makeDirectoryWritableBySandbox(child.handle, uid, gid);
-        try prepareChrootWritableSubdirs(io, child, uid, gid);
+        try prepareChrootWritableSubdirs(io, allocator, child, child_path, uid, gid, skip_paths);
         child.close(io);
     }
 }
 
+fn shouldSkipWritableDir(path: []const u8, skip_paths: []const []const u8) bool {
+    for (skip_paths) |skip_path| {
+        if (std.mem.eql(u8, path, skip_path)) return true;
+    }
+    return false;
+}
+
 fn makeDirectoryWritableBySandbox(fd: std.posix.fd_t, uid: u32, gid: u32) !void {
     const linux = std.os.linux;
-    switch (std.posix.errno(linux.fchown(fd, @intCast(uid), @intCast(gid)))) {
+    switch (std.os.linux.errno(linux.fchown(fd, @intCast(uid), @intCast(gid)))) {
         .SUCCESS => {},
         else => return error.Unexpected,
     }
-    switch (std.posix.errno(linux.fchmod(fd, 0o755))) {
+    switch (std.os.linux.errno(linux.fchmod(fd, 0o755))) {
         .SUCCESS => {},
         else => return error.Unexpected,
     }
@@ -343,11 +357,17 @@ fn runCommandChroot(
 
     var cgroup = try Cgroup.create(io, allocator, options.cgroup_limits);
     defer cgroup.deinit(io, allocator);
-    try prepareChrootWritableDirs(io, allocator, chroot_dir, options.sandbox_uid, options.sandbox_gid);
+    var writable_skip_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer writable_skip_paths.deinit(allocator);
+    for (options.actiondfs_mounts) |mount| switch (mount) {
+        .strict => |strict| if (!strict.mount_in_child) try writable_skip_paths.append(allocator, strict.target),
+        .overlay => {},
+    };
+    try prepareChrootWritableDirs(io, allocator, chroot_dir, options.sandbox_uid, options.sandbox_gid, writable_skip_paths.items);
     for (options.actiondfs_mounts) |mount| {
         switch (mount) {
-            .strict => |strict| try prepareChrootWritableDirs(io, allocator, strict.stage_dir, options.sandbox_uid, options.sandbox_gid),
-            .overlay => |overlay| try prepareChrootWritableDirs(io, allocator, overlay.upperdir, options.sandbox_uid, options.sandbox_gid),
+            .strict => |strict| try prepareChrootWritableDirs(io, allocator, strict.stage_dir, options.sandbox_uid, options.sandbox_gid, &.{}),
+            .overlay => |overlay| try prepareChrootWritableDirs(io, allocator, overlay.upperdir, options.sandbox_uid, options.sandbox_gid, &.{}),
         }
     }
 
@@ -491,7 +511,7 @@ const child_setup_fd: std.posix.fd_t = 3;
 fn forkAction(action: ForkAction) !std.os.linux.pid_t {
     const linux = std.os.linux;
     const rc = linux.fork();
-    switch (std.posix.errno(rc)) {
+    switch (std.os.linux.errno(rc)) {
         .SUCCESS => {},
         .AGAIN, .NOMEM => return error.SystemResources,
         else => return error.Unexpected,
@@ -532,12 +552,17 @@ fn forkAction(action: ForkAction) !std.os.linux.pid_t {
     childWriteSetupComplete();
     const execve_rc = linux.execve(action.exec_path.ptr, action.argv, action.envp);
     childWriteLiteral("actiond child setup failed: execve ");
-    childWriteBytes(@tagName(std.posix.errno(execve_rc)));
+    childWriteBytes(@tagName(std.os.linux.errno(execve_rc)));
+    childWriteLiteral(" rc=");
+    childWriteUsize(execve_rc);
+    childWriteLiteral(" path=");
+    childWriteBytes(action.exec_path);
     childWriteLiteral("\n");
     linux.exit(127);
 }
 
 fn childMountActiondfsStrict(mount: ActiondfsStrictMount) void {
+    if (!mount.mount_in_child) return;
     const linux = std.os.linux;
     childSyscallName(linux.mount(
         mount.fstype.ptr,
@@ -617,7 +642,7 @@ fn childDup2(old: std.posix.fd_t, new: std.posix.fd_t) void {
 }
 
 fn childClose(fd: std.posix.fd_t) void {
-    while (true) switch (std.posix.errno(std.os.linux.close(fd))) {
+    while (true) switch (std.os.linux.errno(std.os.linux.close(fd))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -629,7 +654,7 @@ fn childCloseExtraFdsFrom(first_fd: std.posix.fd_t) void {
         .UNSHARE = true,
         .CLOEXEC = false,
     });
-    switch (std.posix.errno(rc)) {
+    switch (std.os.linux.errno(rc)) {
         .SUCCESS, .NOSYS, .INVAL, .PERM => return,
         else => return,
     }
@@ -648,7 +673,7 @@ fn childWriteFile(path: [*:0]const u8, bytes: []const u8) void {
     var offset: usize = 0;
     while (offset < bytes.len) {
         const rc = linux.write(fd, bytes[offset..].ptr, bytes.len - offset);
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {
                 const n: usize = @intCast(rc);
                 if (n == 0) linux.exit(127);
@@ -662,12 +687,16 @@ fn childWriteFile(path: [*:0]const u8, bytes: []const u8) void {
 }
 
 fn childSyscall(rc: usize) void {
-    if (std.posix.errno(rc) != .SUCCESS) std.os.linux.exit(127);
+    if (std.os.linux.errno(rc) != .SUCCESS) std.os.linux.exit(127);
 }
 
 fn childSyscallName(rc: usize, comptime name: []const u8) void {
-    if (std.posix.errno(rc) == .SUCCESS) return;
+    const errno = std.os.linux.errno(rc);
+    if (errno == .SUCCESS) return;
     childWriteLiteral("actiond child setup failed: " ++ name ++ "\n");
+    childWriteLiteral(" errno=");
+    childWriteBytes(@tagName(errno));
+    childWriteLiteral("\n");
     std.os.linux.exit(127);
 }
 
@@ -679,9 +708,25 @@ fn childWriteBytes(bytes: []const u8) void {
     _ = std.os.linux.write(std.posix.STDERR_FILENO, bytes.ptr, bytes.len);
 }
 
+fn childWriteUsize(value: usize) void {
+    var buffer: [20]u8 = undefined;
+    var n = value;
+    var index = buffer.len;
+    if (n == 0) {
+        childWriteLiteral("0");
+        return;
+    }
+    while (n != 0) {
+        index -= 1;
+        buffer[index] = @intCast('0' + (n % 10));
+        n /= 10;
+    }
+    childWriteBytes(buffer[index..]);
+}
+
 fn linuxPipe() ![2]std.posix.fd_t {
     var fds: [2]std.posix.fd_t = undefined;
-    switch (std.posix.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true }))) {
+    switch (std.os.linux.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true }))) {
         .SUCCESS => return fds,
         .NFILE, .MFILE => return error.SystemResources,
         else => return error.Unexpected,
@@ -694,7 +739,7 @@ fn closePipe(pipe: [2]std.posix.fd_t) void {
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
-    while (true) switch (std.posix.errno(std.os.linux.close(fd))) {
+    while (true) switch (std.os.linux.errno(std.os.linux.close(fd))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -762,7 +807,7 @@ fn collectChildResult(
         }
 
         const rc = std.os.linux.poll(&poll_fds, poll_fds.len, child_poll_timeout_ms);
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
             else => return error.Unexpected,
@@ -812,7 +857,7 @@ fn readSetupSignal(fd: std.posix.fd_t) !bool {
     var byte: [1]u8 = undefined;
     while (true) {
         const rc = std.os.linux.read(fd, byte[0..].ptr, byte.len);
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => return rc == 1,
             .INTR => continue,
             else => return error.Unexpected,
@@ -827,7 +872,7 @@ fn readPipeChunk(
 ) !bool {
     var buffer: [16 * 1024]u8 = undefined;
     const rc = std.os.linux.read(fd, buffer[0..].ptr, buffer.len);
-    switch (std.posix.errno(rc)) {
+    switch (std.os.linux.errno(rc)) {
         .SUCCESS => {
             const n: usize = @intCast(rc);
             if (n == 0) return true;
@@ -848,7 +893,7 @@ fn waitForPid(pid: std.os.linux.pid_t) !Status {
     var raw_status: u32 = 0;
     while (true) {
         const rc = std.os.linux.waitpid(pid, &raw_status, 0);
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => break,
             .INTR => continue,
             else => return error.Unexpected,
@@ -862,7 +907,7 @@ fn waitForPidNoHang(pid: std.os.linux.pid_t) !?Status {
     var raw_status: u32 = 0;
     while (true) {
         const rc = std.os.linux.waitpid(pid, &raw_status, std.os.linux.W.NOHANG);
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return null;
                 break;

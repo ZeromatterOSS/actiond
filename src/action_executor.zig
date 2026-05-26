@@ -29,6 +29,7 @@ const chroot_execroot_prefix = "/workspace/";
 const worker_name = "actiond";
 const supported_libc_runtimes = [_][]const u8{ "glibc2.31", "glibc2.35", "glibc2.39" };
 var next_actiondfs_workspace_id = std.atomic.Value(u64).init(0);
+var persistent_actiondfs_fuse: PersistentActiondfsFuse = .{};
 
 pub const RuntimeMountSources = struct {
     lib: ?[:0]const u8 = null,
@@ -70,6 +71,7 @@ pub const RuntimeMountCache = struct {
 pub const ExecuteOptions = struct {
     runtime_root_path: ?[]const u8 = null,
     use_actiondfs: bool = false,
+    actiondfs_fuse_helper: ?[]const u8 = null,
     cas_blob_root_path: ?[]const u8 = null,
     input_cas_blob_root_path: ?[]const u8 = null,
     actiondfs_stage_root_path: ?[]const u8 = null,
@@ -338,6 +340,7 @@ pub fn executeActionWithOptions(
     var command = try reapi.Command.decodeOwned(allocator, &command_reader);
     defer command.deinit(allocator);
     const platform = executionPlatform(action, command);
+    const action_command_completed = std.Io.Clock.awake.now(io);
 
     const input_root_digest = try cas.Digest.fromReapi(action.input_root_digest orelse return error.MissingInputRootDigest);
     var inputs: std.ArrayListUnmanaged(execroot.Input) = .empty;
@@ -404,6 +407,11 @@ pub fn executeActionWithOptions(
     defer if (actiondfs_workspace) |*workspace| workspace.deinit(io, allocator);
     var owned_cas_blob_root_path: ?[]u8 = null;
     defer if (owned_cas_blob_root_path) |path| allocator.free(path);
+    var actiondfs_init_ns: i96 = 0;
+    var actiondfs_fuse_start_ns: i96 = 0;
+    var actiondfs_stage_open_ns: i96 = 0;
+    var actiondfs_exec_lookup_ns: i96 = 0;
+    const actiondfs_exec_stage_ns: i96 = 0;
     if (use_actiondfs_inputs) {
         const cas_blob_root_path = actiondfsInputBlobRootPath(options) orelse path: {
             var cas_root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -412,6 +420,7 @@ pub fn executeActionWithOptions(
             owned_cas_blob_root_path = value;
             break :path value;
         };
+        const actiondfs_init_start = std.Io.Clock.awake.now(io);
         actiondfs_workspace = try ActiondfsWorkspace.init(
             io,
             allocator,
@@ -422,9 +431,18 @@ pub fn executeActionWithOptions(
             input_root_digest,
             input_mode,
         );
+        actiondfs_init_ns = elapsedNs(actiondfs_init_start, std.Io.Clock.awake.now(io));
+        if (options.actiondfs_fuse_helper) |helper| {
+            const fuse_start = std.Io.Clock.awake.now(io);
+            try actiondfs_workspace.?.startFuse(io, allocator, helper, cas_blob_root_path, input_root_digest);
+            actiondfs_fuse_start_ns = elapsedNs(fuse_start, std.Io.Clock.awake.now(io));
+        }
+        const stage_open_start = std.Io.Clock.awake.now(io);
         actiondfs_stage_dir = try std.Io.Dir.openDirAbsolute(io, actiondfs_workspace.?.stagePath(), .{ .iterate = true });
+        actiondfs_stage_open_ns = elapsedNs(stage_open_start, std.Io.Clock.awake.now(io));
         exec_root_dir = actiondfs_stage_dir.?;
-        actiondfs_exec_path_override = resolveActiondfsExecutablePath(
+        const exec_lookup_start = std.Io.Clock.awake.now(io);
+        const resolved_executable = try resolveActiondfsExecutablePath(
             io,
             allocator,
             store,
@@ -433,10 +451,9 @@ pub fn executeActionWithOptions(
             action_digest,
             command,
             if (use_workspace_chroot) "/workspace" else "",
-        ) catch |err| {
-            logExecuteSetupError("resolve actiondfs executable", action_digest, err);
-            return err;
-        };
+        );
+        actiondfs_exec_lookup_ns = elapsedNs(exec_lookup_start, std.Io.Clock.awake.now(io));
+        if (resolved_executable) |resolved| actiondfs_exec_path_override = resolved;
     }
 
     const materializer = execroot.Materializer.init(store, exec_root_dir);
@@ -458,6 +475,7 @@ pub fn executeActionWithOptions(
         };
     }
     defer materialization.deinit(allocator);
+    const output_parent_start = std.Io.Clock.awake.now(io);
     prepareOutputParents(io, exec_root_dir, command) catch |err| switch (err) {
         error.FileNotFound => return error.OutputParentCreateFailed,
         else => {
@@ -465,6 +483,7 @@ pub fn executeActionWithOptions(
             return err;
         },
     };
+    const output_parent_ns = elapsedNs(output_parent_start, std.Io.Clock.awake.now(io));
 
     const chroot_cwd_prefix = if (use_workspace_chroot) "/workspace" else "";
     var chroot_cwd_owned: ?[]u8 = null;
@@ -478,19 +497,18 @@ pub fn executeActionWithOptions(
         break :cwd value;
     };
 
+    const runtime_mounts_start = std.Io.Clock.awake.now(io);
     var bind_mounts: std.ArrayListUnmanaged(action_runner.BindMount) = .empty;
     const borrowed_bind_mount_count = materialization.bind_mounts.len;
-    var runtime_mount_sources_are_borrowed = false;
     defer {
         for (bind_mounts.items[borrowed_bind_mount_count..]) |mount| {
-            if (!runtime_mount_sources_are_borrowed) allocator.free(mount.source);
+            allocator.free(mount.source);
             allocator.free(mount.target);
         }
         bind_mounts.deinit(allocator);
     }
     try bind_mounts.appendSlice(allocator, materialization.bind_mounts);
     if (options.runtime_mount_cache) |cache| {
-        runtime_mount_sources_are_borrowed = true;
         if (libc_runtime) |libc| {
             const sources = cache.forLibc(libc) orelse return error.UnsupportedLibcRuntime;
             try appendCachedLibcRuntimeMounts(io, allocator, work_root, work_root_path, sources, &bind_mounts);
@@ -508,9 +526,24 @@ pub fn executeActionWithOptions(
             try appendLibcRuntimeMounts(io, allocator, work_root, work_root_path, runtime_root, libc, &bind_mounts);
         }
     }
+    const runtime_mounts_ns = elapsedNs(runtime_mounts_start, std.Io.Clock.awake.now(io));
 
     const input_fetch_completed_wall = timestampNow(io);
     const input_fetch_completed = std.Io.Clock.awake.now(io);
+    if (use_actiondfs_inputs) {
+        logActiondfsSetupTiming(
+            action_digest,
+            elapsedNs(input_fetch_start, action_command_completed),
+            actiondfs_init_ns,
+            actiondfs_fuse_start_ns,
+            actiondfs_stage_open_ns,
+            actiondfs_exec_lookup_ns,
+            actiondfs_exec_stage_ns,
+            output_parent_ns,
+            runtime_mounts_ns,
+            elapsedNs(input_fetch_start, input_fetch_completed),
+        );
+    }
     const execution_start_wall = timestampNow(io);
     const execution_start = std.Io.Clock.awake.now(io);
     var outcome = try action_runner.runCommandWithOptions(io, allocator, store, command, .{
@@ -839,6 +872,91 @@ fn commandPath(command: reapi.Command) ?[]const u8 {
     return null;
 }
 
+const PersistentActiondfsFusePaths = struct {
+    mountpoint: []const u8,
+    registry: []const u8,
+};
+
+const PersistentActiondfsFuse = struct {
+    lock_state: std.atomic.Mutex = .unlocked,
+    child: ?std.process.Child = null,
+    helper: ?[]u8 = null,
+    cas_blob_root: ?[]u8 = null,
+    stage_root: ?[]u8 = null,
+    mountpoint: ?[:0]u8 = null,
+    registry: ?[]u8 = null,
+
+    fn lock(self: *PersistentActiondfsFuse) void {
+        while (!self.lock_state.tryLock()) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn unlock(self: *PersistentActiondfsFuse) void {
+        self.lock_state.unlock();
+    }
+
+    fn ensure(
+        self: *PersistentActiondfsFuse,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        helper: []const u8,
+        cas_blob_root: []const u8,
+        stage_root: []const u8,
+    ) !PersistentActiondfsFusePaths {
+        self.lock();
+        defer self.unlock();
+
+        if (self.child != null) {
+            if (!std.mem.eql(u8, self.helper.?, helper) or
+                !std.mem.eql(u8, self.cas_blob_root.?, cas_blob_root) or
+                !std.mem.eql(u8, self.stage_root.?, stage_root))
+            {
+                return error.PersistentFuseMismatch;
+            }
+            return .{ .mountpoint = self.mountpoint.?, .registry = self.registry.? };
+        }
+
+        try std.Io.Dir.cwd().createDirPath(io, stage_root);
+        const persistent_root = try std.fmt.allocPrint(allocator, "{s}/.persistent", .{stage_root});
+        defer allocator.free(persistent_root);
+        try std.Io.Dir.cwd().createDirPath(io, persistent_root);
+
+        const mountpoint = try std.fmt.allocPrintSentinel(allocator, "{s}/mount", .{persistent_root}, 0);
+        errdefer allocator.free(mountpoint);
+        const registry = try std.fmt.allocPrint(allocator, "{s}/registry", .{persistent_root});
+        errdefer allocator.free(registry);
+        try std.Io.Dir.cwd().createDirPath(io, mountpoint);
+        try std.Io.Dir.cwd().createDirPath(io, registry);
+
+        const argv = [_][]const u8{
+            helper,
+            "--cas",
+            cas_blob_root,
+            "--registry",
+            registry,
+            mountpoint,
+        };
+        var child = try std.process.spawn(io, .{
+            .argv = &argv,
+            .stdin = .ignore,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
+        errdefer child.kill(io);
+
+        try waitForMount(io, allocator, mountpoint, 10_000);
+
+        self.child = child;
+        self.helper = try allocator.dupe(u8, helper);
+        self.cas_blob_root = try allocator.dupe(u8, cas_blob_root);
+        self.stage_root = try allocator.dupe(u8, stage_root);
+        self.mountpoint = mountpoint;
+        self.registry = registry;
+        return .{ .mountpoint = mountpoint, .registry = registry };
+    }
+};
+
 const ActiondfsWorkspace = struct {
     base_path: []u8,
     mode: ActionInputMode,
@@ -849,6 +967,9 @@ const ActiondfsWorkspace = struct {
     overlay_data: ?[:0]u8 = null,
     mounts: [1]action_runner.ActiondfsMount,
     collection_mounted: bool = false,
+    parent_mounted_target: ?[:0]u8 = null,
+    persistent_registry_entry: ?[]u8 = null,
+    fuse_child: ?std.process.Child = null,
 
     fn init(
         io: std.Io,
@@ -942,6 +1063,66 @@ const ActiondfsWorkspace = struct {
         };
     }
 
+    fn startFuse(
+        self: *ActiondfsWorkspace,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        helper: []const u8,
+        cas_blob_root: []const u8,
+        input_root_digest: cas.Digest,
+    ) !void {
+        var target: [:0]u8 = undefined;
+        var stage: [:0]u8 = undefined;
+        switch (self.mounts[0]) {
+            .strict => |*mount| {
+                target = mount.target;
+                stage = mount.stage_dir;
+                mount.mount_in_child = false;
+            },
+            .overlay => return error.UnsupportedHost,
+        }
+        var root_hash_buffer: [64]u8 = undefined;
+        const root_hash = input_root_digest.formatHex(&root_hash_buffer);
+        if (actiondfsPersistentFuseEnabled()) {
+            const paths = try persistent_actiondfs_fuse.ensure(io, allocator, helper, cas_blob_root, std.fs.path.dirname(self.base_path) orelse return error.InvalidActiondfsStageRoot);
+            const action_name = std.fs.path.basename(self.base_path);
+            self.persistent_registry_entry = try writePersistentFuseRegistryEntry(io, allocator, paths.registry, action_name, root_hash, stage);
+            errdefer if (self.persistent_registry_entry) |path| {
+                std.Io.Dir.cwd().deleteFile(io, path) catch {};
+                allocator.free(path);
+                self.persistent_registry_entry = null;
+            };
+            const source = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ paths.mountpoint, action_name }, 0);
+            defer allocator.free(source);
+            try bindMountActiondfsSource(source, target);
+            errdefer _ = std.os.linux.umount2(target.ptr, std.os.linux.MNT.DETACH);
+            try waitForMount(io, allocator, target, 10_000);
+            self.parent_mounted_target = target;
+            return;
+        }
+        const argv = [_][]const u8{
+            helper,
+            "--root",
+            root_hash,
+            "--cas",
+            cas_blob_root,
+            "--stage",
+            stage,
+            target,
+        };
+        var child = try std.process.spawn(io, .{
+            .argv = &argv,
+            .stdin = .ignore,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
+        errdefer child.kill(io);
+
+        try waitForMount(io, allocator, target, 10_000);
+        self.fuse_child = child;
+        self.parent_mounted_target = target;
+    }
+
     fn mountForCollection(self: *ActiondfsWorkspace) !void {
         if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
         if (self.collection_mounted) return;
@@ -993,6 +1174,16 @@ const ActiondfsWorkspace = struct {
                 if (self.overlay_target) |target| _ = std.os.linux.umount2(target.ptr, std.os.linux.MNT.DETACH);
                 if (self.lower_target) |target| _ = std.os.linux.umount2(target.ptr, std.os.linux.MNT.DETACH);
             }
+            if (self.parent_mounted_target) |target| {
+                _ = std.os.linux.umount2(target.ptr, std.os.linux.MNT.DETACH);
+            }
+        }
+        if (self.persistent_registry_entry) |path| {
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            allocator.free(path);
+        }
+        if (self.fuse_child) |*child| {
+            child.kill(io);
         }
         std.Io.Dir.cwd().deleteTree(io, self.base_path) catch |err| {
             std.log.warn("failed to remove actiondfs workspace {s}: {s}", .{ self.base_path, @errorName(err) });
@@ -1038,6 +1229,90 @@ fn createActiondfsBasePath(
         };
         return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, name });
     }
+}
+
+fn actiondfsPersistentFuseEnabled() bool {
+    return true;
+}
+
+fn writePersistentFuseRegistryEntry(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    registry: []const u8,
+    action_name: []const u8,
+    root_hash: []const u8,
+    stage: []const u8,
+) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ registry, action_name });
+    errdefer allocator.free(path);
+    const data = try std.fmt.allocPrint(allocator, "root={s}\nstage={s}\n", .{ root_hash, stage });
+    defer allocator.free(data);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = data,
+        .flags = .{ .read = true, .permissions = .default_file },
+    });
+    return path;
+}
+
+fn bindMountActiondfsSource(source: [:0]const u8, target: [:0]const u8) !void {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+    const rc = std.os.linux.mount(source.ptr, target.ptr, null, std.os.linux.MS.BIND, 0);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        .NOENT => return error.FileNotFound,
+        .ACCES, .PERM => return error.AccessDenied,
+        else => return error.MountFailed,
+    }
+}
+
+fn waitForMount(io: std.Io, allocator: std.mem.Allocator, target: []const u8, timeout_ms: u64) !void {
+    const start = std.Io.Clock.awake.now(io);
+    while (true) {
+        if (try mountInfoContains(io, allocator, target)) return;
+        const elapsed_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+        if (elapsed_ns >= timeout_ms * std.time.ns_per_ms) return error.MountFailed;
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+}
+
+fn sleepNs(ns: u64) void {
+    var request = std.posix.timespec{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    while (std.posix.errno(std.os.linux.nanosleep(&request, &request)) == .INTR) {}
+}
+
+fn mountInfoContains(io: std.Io, allocator: std.mem.Allocator, target: []const u8) !bool {
+    var file = std.Io.Dir.cwd().openFile(io, "/proc/self/mountinfo", .{}) catch return false;
+    defer file.close(io);
+    const bytes = try readFileAlloc(allocator, file.handle, 4 * 1024 * 1024);
+    defer allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        var index: usize = 0;
+        while (fields.next()) |field| : (index += 1) {
+            if (index == 4 and std.mem.eql(u8, field, target)) return true;
+            if (index > 4) break;
+        }
+    }
+    return false;
+}
+
+fn readFileAlloc(allocator: std.mem.Allocator, fd: std.Io.File.Handle, max_bytes: usize) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const n = try readFdRetry(fd, &buffer);
+        if (n == 0) break;
+        if (out.items.len + n > max_bytes) return error.FileTooBig;
+        try out.appendSlice(allocator, buffer[0..n]);
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 fn runtimeArch() ![]const u8 {
@@ -1151,10 +1426,12 @@ fn appendCachedRuntimeMount(
     bind_mounts: *std.ArrayListUnmanaged(action_runner.BindMount),
 ) !void {
     try chroot_dir.createDirPath(io, target_rel);
+    const source_copy = try allocator.dupeZ(u8, source);
+    errdefer allocator.free(source_copy);
     const target = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ chroot_path, target_rel }, 0);
     errdefer allocator.free(target);
     try bind_mounts.append(allocator, .{
-        .source = @constCast(source),
+        .source = source_copy,
         .target = target,
     });
 }
@@ -1368,6 +1645,37 @@ fn logActionTiming(
             output_directories,
             stress_case,
             input_mode.label(),
+        },
+    );
+}
+
+fn logActiondfsSetupTiming(
+    action_digest: cas.Digest,
+    action_command_ns: i96,
+    actiondfs_init_ns: i96,
+    fuse_start_ns: i96,
+    stage_open_ns: i96,
+    exec_lookup_ns: i96,
+    exec_stage_ns: i96,
+    output_parent_ns: i96,
+    runtime_mounts_ns: i96,
+    input_fetch_ns: i96,
+) void {
+    var hash: [64]u8 = undefined;
+    std.log.info(
+        "actiondfs setup timing {s}/{d}: action_command_ns={d} actiondfs_init_ns={d} fuse_start_ns={d} stage_open_ns={d} exec_lookup_ns={d} exec_stage_ns={d} output_parent_ns={d} runtime_mounts_ns={d} input_fetch_ns={d}",
+        .{
+            action_digest.formatHex(&hash),
+            action_digest.size_bytes,
+            action_command_ns,
+            actiondfs_init_ns,
+            fuse_start_ns,
+            stage_open_ns,
+            exec_lookup_ns,
+            exec_stage_ns,
+            output_parent_ns,
+            runtime_mounts_ns,
+            input_fetch_ns,
         },
     );
 }
