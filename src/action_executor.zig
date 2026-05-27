@@ -90,6 +90,7 @@ pub const RuntimeMountCache = struct {
 pub const ExecuteOptions = struct {
     runtime_root_path: ?[]const u8 = null,
     use_actiondfs: bool = false,
+    log_timings: bool = true,
     cas_blob_root_path: ?[]const u8 = null,
     input_cas_blob_root_path: ?[]const u8 = null,
     actiondfs_stage_root_path: ?[]const u8 = null,
@@ -608,26 +609,28 @@ pub fn executeDecodedActionWithOptions(
         .output_upload_completed_timestamp = output_upload_completed_wall,
     };
     if (comptime build_options.executor_timing_logs) {
-        logActionTiming(
-            action_digest,
-            total_start,
-            input_fetch_start,
-            input_fetch_completed,
-            execution_start,
-            execution_completed,
-            output_upload_start,
-            output_upload_completed,
-            inputs.items.len,
-            directory_inputs.items.len,
-            bind_mounts.items.len,
-            if (actiondfs_workspace != null) @as(usize, 1) else 0,
-            outcome.output_files.len,
-            outcome.output_directories.len,
-            stressCaseFromCommand(command),
-            input_mode,
-        );
-        if (outcome.runner_timing) |timing| {
-            logRunnerTiming(action_digest, timing);
+        if (options.log_timings) {
+            logActionTiming(
+                action_digest,
+                total_start,
+                input_fetch_start,
+                input_fetch_completed,
+                execution_start,
+                execution_completed,
+                output_upload_start,
+                output_upload_completed,
+                inputs.items.len,
+                directory_inputs.items.len,
+                bind_mounts.items.len,
+                if (actiondfs_workspace != null) @as(usize, 1) else 0,
+                outcome.output_files.len,
+                outcome.output_directories.len,
+                stressCaseFromCommand(command),
+                input_mode,
+            );
+            if (outcome.runner_timing) |timing| {
+                logRunnerTiming(action_digest, timing);
+            }
         }
     }
     return outcome;

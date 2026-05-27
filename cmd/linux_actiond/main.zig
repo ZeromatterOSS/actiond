@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
         \\linux-actiond zig={s} bazel={s}
         \\usage:
         \\  linux-actiond serve [--listen=127.0.0.1:8980] [--root=/tmp/actiond] [--runtime-image=/path/runtimes.sqfs|--runtime-root=/mnt/runtimes]
-        \\  linux-actiond serve-vm --cas-image=/path/cas.ext4 [--kernel=/path/bzImage[.zst]] [--initramfs=/path/initramfs.cpio[.zst]] [--runtime-image=/path/runtimes.sqfs] [--listen=127.0.0.1:8980] [--root=/tmp/actiond-vm] [--qemu=qemu-system-x86_64] [--qemu-machine=q35|microvm] [--qemu-cache=none] [--qemu-aio=io_uring] [--qemu-block-queues=N]
+        \\  linux-actiond serve-vm --cas-image=/path/cas.ext4 [--kernel=/path/bzImage[.zst]] [--initramfs=/path/initramfs.cpio[.zst]] [--runtime-image=/path/runtimes.sqfs] [--listen=127.0.0.1:8980] [--root=/tmp/actiond-vm] [--qemu=qemu-system-x86_64] [--qemu-machine=q35|microvm] [--qemu-cache=none] [--qemu-aio=io_uring] [--qemu-block-queues=N] [--guest-executor-timing-logs=0|1]
         \\
     , .{
         actiond.version.zig,

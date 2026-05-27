@@ -34,6 +34,7 @@ pub const Options = struct {
     drive_cache: []const u8 = "none",
     drive_aio: ?[]const u8 = default_drive_aio,
     block_queue_count: ?u32 = null,
+    guest_executor_timing_logs: bool = true,
 };
 
 pub const MachineModel = enum {
@@ -87,7 +88,7 @@ pub const Machine = struct {
         defer allocator.free(cas_drive);
         const runtime_drive = try driveArg(allocator, "runtimes", runtime_image_path, true, options.drive_cache, options.drive_aio);
         defer allocator.free(runtime_drive);
-        const kernel_append = try kernelAppendArg(allocator, options.format_cas_image);
+        const kernel_append = try kernelAppendArg(allocator, options.format_cas_image, options.guest_executor_timing_logs);
         defer allocator.free(kernel_append);
 
         const argv = [_][]const u8{
@@ -233,6 +234,23 @@ fn blockDeviceArg(
     return std.fmt.allocPrint(allocator, "{s},drive={s}", .{ driver, drive_id });
 }
 
+fn kernelAppendArg(
+    allocator: std.mem.Allocator,
+    format_cas_image: bool,
+    guest_executor_timing_logs: bool,
+) ![]u8 {
+    if (format_cas_image and !guest_executor_timing_logs) {
+        return try allocator.dupe(u8, "console=ttyS0 panic=-1 actiond.format_cas=1 actiond.executor_timing=0 -- --executor-timing-logs=0");
+    }
+    if (format_cas_image) {
+        return try allocator.dupe(u8, "console=ttyS0 panic=-1 actiond.format_cas=1");
+    }
+    if (!guest_executor_timing_logs) {
+        return try allocator.dupe(u8, "console=ttyS0 panic=-1 actiond.executor_timing=0 -- --executor-timing-logs=0");
+    }
+    return try allocator.dupe(u8, "console=ttyS0 panic=-1");
+}
+
 fn connectVsock(cid: u32, port: u32) !std.posix.fd_t {
     const socket_rc = linux.socket(linux.AF.VSOCK, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     switch (std.posix.errno(socket_rc)) {
@@ -274,13 +292,6 @@ fn sleepMilliseconds(milliseconds: u32) void {
     while (std.c.nanosleep(&request, &request) != 0) {}
 }
 
-fn kernelAppendArg(allocator: std.mem.Allocator, format_cas_image: bool) ![]u8 {
-    if (format_cas_image) {
-        return try allocator.dupe(u8, "console=ttyS0 panic=-1 actiond.format_cas=1");
-    }
-    return try allocator.dupe(u8, "console=ttyS0 panic=-1");
-}
-
 test "qemu VM start is Linux x86_64-only" {
     if (comptime builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) {
         try std.testing.expectError(error.UnsupportedHost, Machine.start(std.testing.io, std.testing.allocator, .{
@@ -302,14 +313,28 @@ test "driveArg includes optional cache and aio modes" {
     try std.testing.expectEqualStrings("if=none,id=runtimes,file=/tmp/runtimes.sqfs,format=raw,readonly=on,cache=none,aio=io_uring", with_aio);
 }
 
-test "kernelAppendArg can request guest CAS formatting" {
-    const unchanged = try kernelAppendArg(std.testing.allocator, false);
-    defer std.testing.allocator.free(unchanged);
-    try std.testing.expectEqualStrings("console=ttyS0 panic=-1", unchanged);
+test "kernelAppendArg can request CAS formatting and disable guest executor timing logs" {
+    const enabled = try kernelAppendArg(std.testing.allocator, false, true);
+    defer std.testing.allocator.free(enabled);
+    try std.testing.expectEqualStrings("console=ttyS0 panic=-1", enabled);
 
-    const formatted = try kernelAppendArg(std.testing.allocator, true);
+    const formatted = try kernelAppendArg(std.testing.allocator, true, true);
     defer std.testing.allocator.free(formatted);
     try std.testing.expectEqualStrings("console=ttyS0 panic=-1 actiond.format_cas=1", formatted);
+
+    const disabled = try kernelAppendArg(std.testing.allocator, false, false);
+    defer std.testing.allocator.free(disabled);
+    try std.testing.expectEqualStrings(
+        "console=ttyS0 panic=-1 actiond.executor_timing=0 -- --executor-timing-logs=0",
+        disabled,
+    );
+
+    const formatted_disabled = try kernelAppendArg(std.testing.allocator, true, false);
+    defer std.testing.allocator.free(formatted_disabled);
+    try std.testing.expectEqualStrings(
+        "console=ttyS0 panic=-1 actiond.format_cas=1 actiond.executor_timing=0 -- --executor-timing-logs=0",
+        formatted_disabled,
+    );
 }
 
 test "qemuMachineArg selects KVM or TCG accelerators" {

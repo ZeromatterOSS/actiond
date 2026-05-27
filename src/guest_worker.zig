@@ -6,6 +6,7 @@ const bytestream_service = @import("bytestream_service.zig");
 const cas = @import("cas.zig");
 const control_protocol = @import("control_protocol.zig");
 const grpc_http2_server = @import("grpc_http2_server.zig");
+const guest_init = @import("guest_init.zig");
 const reapi_dispatch = @import("reapi_dispatch.zig");
 const staged_cas_index = @import("staged_cas_index.zig");
 const vsock = @import("vsock.zig");
@@ -19,8 +20,21 @@ pub const guest_cas_blob_root_path = guest_cas_root_path ++ "/blobs/sha256";
 pub const guest_actiondfs_stage_name = "actiondfs-stage";
 pub const guest_actiondfs_stage_root_path = guest_cas_root_path ++ "/" ++ guest_actiondfs_stage_name;
 
+pub const Options = struct {
+    log_executor_timings: bool = true,
+};
+
 pub fn run(io: std.Io) !void {
+    return runWithOptions(io, .{});
+}
+
+pub fn runWithOptions(io: std.Io, options: Options) !void {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+
+    var resolved_options = options;
+    if (guest_init.kernelCmdlineDisablesExecutorTimingLogs()) {
+        resolved_options.log_executor_timings = false;
+    }
 
     const allocator = std.heap.smp_allocator;
     var cas_dir = try std.Io.Dir.openDirAbsolute(io, guest_cas_root_path, .{});
@@ -46,6 +60,7 @@ pub fn run(io: std.Io) !void {
         .input_cas_blob_root_path = guest_cas_blob_root_path,
         .actiondfs_stage_root_path = guest_actiondfs_stage_root_path,
         .staged_cas_index = &cas_presence_index,
+        .log_timings = resolved_options.log_executor_timings,
     });
 
     const server: reapi_dispatch.Server = .{
@@ -62,7 +77,10 @@ pub fn run(io: std.Io) !void {
     var buffer: [256]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &buffer);
     const stderr = &stderr_writer.interface;
-    stderr.print("linux-actiond guest worker listening on vsock:{d}\n", .{vsock.control_port}) catch {};
+    stderr.print("linux-actiond guest worker listening on vsock:{d} executor_timing_logs={}\n", .{
+        vsock.control_port,
+        resolved_options.log_executor_timings,
+    }) catch {};
     stderr.flush() catch {};
 
     const grpc_thread = try std.Thread.spawn(.{}, grpcListenerThread, .{ io, allocator, server });

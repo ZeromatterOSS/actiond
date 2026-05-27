@@ -50,6 +50,8 @@ executor_timing_logs="${ACTIOND_LLVM_SMOKE_EXECUTOR_TIMING_LOGS:-1}"
 server_target="${ACTIOND_LLVM_SMOKE_SERVER_TARGET:-${default_server_target}}"
 server_script_path="${ACTIOND_LLVM_SMOKE_SERVER_SCRIPT_PATH:-${default_server_script_path}}"
 qemu_path="${ACTIOND_LLVM_VM_SMOKE_QEMU:-${ACTIOND_VM_QEMU:-}}"
+guest_executor_timing_logs="${ACTIOND_VM_EXECUTOR_TIMING_LOGS:-1}"
+parse_vm_timings="${ACTIOND_LLVM_SMOKE_PARSE_TIMINGS:-1}"
 build_mode_flags=(
   -c opt
   --strip=always
@@ -79,6 +81,9 @@ case "${executor_timing_logs}" in
     exit 1
     ;;
 esac
+if [[ "${executor_timing_logs}" != "1" || "${guest_executor_timing_logs}" != "1" ]]; then
+  parse_vm_timings="${ACTIOND_LLVM_SMOKE_PARSE_TIMINGS:-0}"
+fi
 
 server_pid=""
 server_log=""
@@ -153,7 +158,10 @@ prepare_server() {
       echo "prebuilt standalone script is not executable: ${prebuilt_server_script_path}" >&2
       return 1
     fi
-    printf '%s\n' "${prebuilt_server_script_path}"
+    local copied_server="${output_root}/$(basename "${prebuilt_server_script_path}")"
+    cp "${prebuilt_server_script_path}" "${copied_server}"
+    chmod +x "${copied_server}"
+    printf '%s\n' "${copied_server}"
     return 0
   fi
 
@@ -226,6 +234,7 @@ run_smoke() {
   fi
   if [[ "${host_os}" == "Linux" ]]; then
     server_cmd+=(--qemu-machine="${ACTIOND_VM_QEMU_MACHINE:-q35}")
+    server_cmd+=(--guest-executor-timing-logs="${guest_executor_timing_logs}")
   fi
   if [[ "${host_os}" == "Linux" && "${ACTIOND_VM_ALLOW_TCG:-0}" == "1" ]]; then
     server_cmd+=(--allow-tcg)
@@ -284,18 +293,31 @@ run_smoke() {
   sleep 1.2
 
   elapsed="$(sed -n 's/.*Elapsed time: \([0-9.]*s\).*/\1/p' "${build_log}" | tail -n 1)"
-  if [[ "${executor_timing_logs}" == "1" && ! -s "${measured_server_log}" ]]; then
+  if [[ "${parse_vm_timings}" == "1" && ! -s "${measured_server_log}" ]]; then
     echo "measured VM log slice is empty; source log: ${server_log}" >&2
     return 1
   fi
 
-  if [[ "${executor_timing_logs}" == "1" ]]; then
+  if [[ "${parse_vm_timings}" == "1" ]]; then
     "${repo_root}/test/parse_timings.py" "${measured_server_log}" \
       --mode "llvm-vm" \
-      --command "ACTIOND_VM_CAS_IMAGE_SIZE_MIB=${cas_image_size_mib} ACTIOND_VM_MEMORY_MIB=${memory_mib} ACTIOND_VM_CPUS=${cpus} ACTIOND_LLVM_SMOKE_JOBS=${jobs} ACTIOND_VM_QEMU_MACHINE=${ACTIOND_VM_QEMU_MACHINE:-q35} ACTIOND_VM_QEMU_CACHE=${ACTIOND_VM_QEMU_CACHE:-none} ACTIOND_VM_QEMU_AIO=${ACTIOND_VM_QEMU_AIO:-io_uring} ACTIOND_VM_QEMU_BLOCK_QUEUES=${ACTIOND_VM_QEMU_BLOCK_QUEUES:-} ACTIOND_LLVM_SMOKE_EXECUTOR_TIMING_LOGS=${executor_timing_logs} e2e/run_llvm_vm_smoke.sh" \
+      --command "ACTIOND_VM_CAS_IMAGE_SIZE_MIB=${cas_image_size_mib} ACTIOND_VM_MEMORY_MIB=${memory_mib} ACTIOND_VM_CPUS=${cpus} ACTIOND_LLVM_SMOKE_JOBS=${jobs} ACTIOND_VM_QEMU_MACHINE=${ACTIOND_VM_QEMU_MACHINE:-q35} ACTIOND_VM_QEMU_CACHE=${ACTIOND_VM_QEMU_CACHE:-none} ACTIOND_VM_QEMU_AIO=${ACTIOND_VM_QEMU_AIO:-io_uring} ACTIOND_VM_QEMU_BLOCK_QUEUES=${ACTIOND_VM_QEMU_BLOCK_QUEUES:-} ACTIOND_LLVM_SMOKE_EXECUTOR_TIMING_LOGS=${executor_timing_logs} ACTIOND_VM_EXECUTOR_TIMING_LOGS=${guest_executor_timing_logs} e2e/run_llvm_vm_smoke.sh" \
       --bazel-elapsed "${elapsed:-unknown}" \
       --workload "${smoke_target}, warmup=${warmup_target:-none}, jobs=${jobs_label}" \
       --output "${timings}"
+  else
+    cat >"${timings}" <<EOF
+# LLVM VM Smoke Timing
+
+Mode: llvm-vm
+Workload: ${smoke_target}, warmup=${warmup_target:-none}, jobs=${jobs_label}
+Command: ACTIOND_VM_CAS_IMAGE_SIZE_MIB=${cas_image_size_mib} ACTIOND_VM_MEMORY_MIB=${memory_mib} ACTIOND_VM_CPUS=${cpus} ACTIOND_LLVM_SMOKE_JOBS=${jobs} ACTIOND_VM_QEMU_MACHINE=${ACTIOND_VM_QEMU_MACHINE:-q35} ACTIOND_VM_QEMU_CACHE=${ACTIOND_VM_QEMU_CACHE:-none} ACTIOND_VM_QEMU_AIO=${ACTIOND_VM_QEMU_AIO:-io_uring} ACTIOND_VM_QEMU_BLOCK_QUEUES=${ACTIOND_VM_QEMU_BLOCK_QUEUES:-} ACTIOND_VM_EXECUTOR_TIMING_LOGS=${guest_executor_timing_logs} ACTIOND_LLVM_SMOKE_PARSE_TIMINGS=0 e2e/run_llvm_vm_smoke.sh
+Bazel elapsed: ${elapsed:-unknown}
+Executor timing logs: ${guest_executor_timing_logs}
+Server log: ${server_log}
+Measured server log: ${measured_server_log}
+Actiondfs stats: ${output_root}/actiondfs_stats.txt
+EOF
   fi
 
   cleanup_server 0

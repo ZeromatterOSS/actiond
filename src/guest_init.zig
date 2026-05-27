@@ -44,6 +44,15 @@ const cas_mount_flags = std.os.linux.MS.NOSUID |
     std.os.linux.MS.NODEV |
     std.os.linux.MS.NOATIME;
 pub const worker_argv = [_][]const u8{ "/actiond", "--guest-worker" };
+pub const worker_argv_without_executor_timing_logs = [_][]const u8{
+    "/actiond",
+    "--guest-worker",
+    "--executor-timing-logs=0",
+};
+
+pub const WorkerOptions = struct {
+    log_executor_timings: bool = true,
+};
 
 const CasMountAttempt = enum {
     mounted,
@@ -52,6 +61,10 @@ const CasMountAttempt = enum {
 };
 
 pub fn run(io: std.Io) !void {
+    return runWithWorkerOptions(io, .{});
+}
+
+pub fn runWithWorkerOptions(io: std.Io, options: WorkerOptions) !void {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
 
     var buffer: [256]u8 = undefined;
@@ -66,7 +79,43 @@ pub fn run(io: std.Io) !void {
     stderr.writeAll("linux-actiond guest init mounted filesystems; starting worker\n") catch {};
     stderr.flush() catch {};
 
-    return std.process.replace(io, .{ .argv = &worker_argv });
+    const argv = if (!options.log_executor_timings or kernelCmdlineDisablesExecutorTimingLogs())
+        worker_argv_without_executor_timing_logs[0..]
+    else
+        worker_argv[0..];
+    return std.process.replace(io, .{ .argv = argv });
+}
+
+pub fn kernelCmdlineDisablesExecutorTimingLogs() bool {
+    var buffer: [4096]u8 = undefined;
+    const fd_rc = std.os.linux.open("/proc/cmdline", .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+    }, 0);
+    switch (std.posix.errno(fd_rc)) {
+        .SUCCESS => {},
+        else => return false,
+    }
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = std.os.linux.close(fd);
+
+    const read_rc = std.posix.system.read(fd, buffer[0..].ptr, buffer.len);
+    switch (std.posix.errno(read_rc)) {
+        .SUCCESS => return cmdlineDisablesExecutorTimingLogs(buffer[0..@intCast(read_rc)]),
+        else => return false,
+    }
+}
+
+pub fn cmdlineDisablesExecutorTimingLogs(cmdline: []const u8) bool {
+    var tokens = std.mem.tokenizeScalar(u8, cmdline, ' ');
+    while (tokens.next()) |token| {
+        if (std.mem.eql(u8, token, "actiond.executor_timing=0") or
+            std.mem.eql(u8, token, "actiond.executor_timing=false"))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn mountCasStore(io: std.Io, stderr: *std.Io.Writer, format_if_needed: bool) !void {
@@ -338,6 +387,7 @@ test "guest init mount plan stays minimal" {
     try std.testing.expect((cas_mount_flags & std.os.linux.MS.NOATIME) != 0);
     try std.testing.expectEqualStrings("/actiond", worker_argv[0]);
     try std.testing.expectEqualStrings("--guest-worker", worker_argv[1]);
+    try std.testing.expectEqualStrings("--executor-timing-logs=0", worker_argv_without_executor_timing_logs[2]);
 
     for (mounts) |mount_spec| {
         try std.testing.expect(!std.mem.eql(u8, mount_spec.fstype, "nfs"));
@@ -351,4 +401,10 @@ test "guest init parses CAS format kernel flag as a token" {
     try std.testing.expect(!cmdlineRequestsCasFormat("console=hvc0 quiet"));
     try std.testing.expect(!cmdlineRequestsCasFormat("fooactiond.format_cas=1"));
     try std.testing.expect(!cmdlineRequestsCasFormat("actiond.format_cas=0"));
+}
+
+test "guest init parses executor timing kernel arg" {
+    try std.testing.expect(cmdlineDisablesExecutorTimingLogs("console=ttyS0 actiond.executor_timing=0 panic=-1"));
+    try std.testing.expect(cmdlineDisablesExecutorTimingLogs("actiond.executor_timing=false"));
+    try std.testing.expect(!cmdlineDisablesExecutorTimingLogs("console=ttyS0 actiond.executor_timing=1"));
 }

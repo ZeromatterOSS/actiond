@@ -46,6 +46,7 @@ pub const ServeQemuVmOptions = struct {
     qemu_cache: []const u8 = "none",
     qemu_aio: ?[]const u8 = qemu_vm.default_drive_aio,
     qemu_block_queues: ?u32 = null,
+    guest_executor_timing_logs: bool = true,
 };
 
 pub fn parseServeVmArgs(args: []const []const u8) !ServeVmOptions {
@@ -179,6 +180,12 @@ pub fn parseServeQemuVmArgs(args: []const []const u8) !ServeQemuVmOptions {
             options.qemu_block_queues = try parseU32(args[i]);
         } else if (std.mem.startsWith(u8, arg, "--qemu-block-queues=")) {
             options.qemu_block_queues = try parseU32(arg["--qemu-block-queues=".len..]);
+        } else if (std.mem.eql(u8, arg, "--guest-executor-timing-logs")) {
+            i += 1;
+            if (i >= args.len) return error.MissingServeArgumentValue;
+            options.guest_executor_timing_logs = try parseBool(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--guest-executor-timing-logs=")) {
+            options.guest_executor_timing_logs = try parseBool(arg["--guest-executor-timing-logs=".len..]);
         } else {
             try filtered.append(std.heap.smp_allocator, arg);
         }
@@ -283,6 +290,7 @@ fn serveWithMachine(
             .drive_cache = qemu_options.qemu_cache,
             .drive_aio = qemu_options.qemu_aio,
             .block_queue_count = qemu_options.qemu_block_queues,
+            .guest_executor_timing_logs = qemu_options.guest_executor_timing_logs,
         })
     else
         try darwin_vm.Machine.start(io, allocator, .{
@@ -379,6 +387,12 @@ fn parseU32(value: []const u8) !u32 {
 
 fn parseU64(value: []const u8) !u64 {
     return std.fmt.parseInt(u64, value, 10);
+}
+
+fn parseBool(value: []const u8) !bool {
+    if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false")) return false;
+    return error.InvalidBoolean;
 }
 
 fn prepareBootInitramfs(
@@ -551,6 +565,7 @@ test "parseServeQemuVmArgs accepts QEMU flags" {
         "--qemu-cache=none",
         "--qemu-aio=io_uring",
         "--qemu-block-queues=8",
+        "--guest-executor-timing-logs=0",
         "--allow-tcg",
     });
 
@@ -562,6 +577,7 @@ test "parseServeQemuVmArgs accepts QEMU flags" {
     try std.testing.expectEqualStrings("none", options.qemu_cache);
     try std.testing.expectEqualStrings("io_uring", options.qemu_aio.?);
     try std.testing.expectEqual(@as(u32, 8), options.qemu_block_queues.?);
+    try std.testing.expect(!options.guest_executor_timing_logs);
     try std.testing.expect(options.allow_tcg);
 }
 
