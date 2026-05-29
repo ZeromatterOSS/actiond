@@ -26,9 +26,6 @@ pub fn serve(
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    var connections: std.Io.Group = .init;
-    defer connections.cancel(io);
-
     std.log.info("actiond VM raw gRPC bridge listening on {s} -> vsock:{d}", .{ listen, vsock.grpc_port });
     while (true) {
         var accepted = listener.accept(io) catch |err| {
@@ -41,16 +38,17 @@ pub fn serve(
         setTcpNoDelay(client_fd) catch |err| {
             std.log.debug("raw gRPC bridge TCP_NODELAY failed: {s}", .{@errorName(err)});
         };
-        connections.concurrent(io, connectionTask, .{ io, machine, client_fd }) catch |err| {
+        const thread = std.Thread.spawn(.{}, connectionThread, .{ io, machine, client_fd }) catch |err| {
             accepted.close(io);
             std.log.err("raw gRPC bridge connection task failed: {s}", .{@errorName(err)});
             sleepMilliseconds(io, 10);
             continue;
         };
+        thread.detach();
     }
 }
 
-fn connectionTask(io: std.Io, machine: anytype, client_fd: std.posix.fd_t) void {
+fn connectionThread(io: std.Io, machine: anytype, client_fd: std.posix.fd_t) void {
     defer closeFd(client_fd);
     const started = std.Io.Clock.awake.now(io);
 
